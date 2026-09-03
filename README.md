@@ -468,12 +468,29 @@ when you move. What it draws is the *rendered* page — orientation, straighteni
 crop and blurs all applied, exactly what the exporter will write — so it is a
 check on the product, not on the source.
 
-* **Arrows, PageUp/PageDown, or click the outer third** of either page to turn.
-  The wheel turns pages; **Ctrl+wheel** zooms; **Home** and **End** jump to the
-  ends; the slider scrubs.
+* **Click a page to turn it** — the left page goes back, the right page goes on,
+  split at the spine, so the half you clicked is the half you were reading.
+  Arrows and PageUp/PageDown do the same. The wheel turns pages; **Ctrl+wheel**
+  zooms; **Home** and **End** jump to the ends; the slider scrubs.
+* **The turn is animated as one sheet**: its front closes onto the spine, then
+  its back opens out the other side, 420 ms end to end. Jumping more than one
+  spread — the slider, Home, End — cuts straight there instead, because an
+  animation between pages that aren't adjacent is a lie about the document.
+* **The book is fitted once, not per spread.** The scale comes from the largest
+  pair in the document — the widest left page beside the widest right one, and
+  the tallest page — so every spread is drawn at the same size and the book
+  doesn't breathe as you turn it. Nothing overflows, whatever the window shape,
+  and a fold-out that is twice the width of its neighbours simply sets the
+  scale for everything. The spine stays at the centre of the window.
 * **First page is a cover** is on by default, because a bound document opens
   with page one alone on the right. Turn it off for loose sheets or a folded
   leaflet and the pairs start from page one.
+* **The covers stand where a book puts them.** Page one sits on the *right* of
+  the spine with its left edge against the gutter — the whole block is still
+  under it, so it has nowhere else to be. The back cover has nothing left
+  beneath it, so the book eases sideways until that page is in the middle of
+  the window: it travels there over the length of the turn rather than
+  jumping, which is what tells you you have reached the end.
 * It reads the 2200 px proxies, and fetches the detail tier on a worker thread
   once you zoom far enough in for the difference to show — the same bargain the
   editing canvas makes.

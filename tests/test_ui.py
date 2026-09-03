@@ -22,7 +22,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from PySide6.QtCore import QPointF, Qt, QEvent
+from PySide6.QtCore import QAbstractAnimation, QPointF, Qt, QEvent
 from PySide6.QtGui import QImage, QKeyEvent, QMouseEvent
 from PySide6.QtWidgets import QApplication, QWidget
 
@@ -1567,6 +1567,143 @@ def main():
     check("it zooms", abs(bk.view.zoom - 2.0) < 1e-6, str(bk.view.zoom))
     check("and still paints when zoomed", nonblank(paint(bk.view)))
     bk.view.set_zoom(1.0)
+
+    # one scale for the whole document, so the book does not breathe as it is
+    # turned - and every spread inside the window, at any window shape
+    scales = []
+    for i in range(bk.view.count()):
+        bk.view.spread = i
+        scales.append(round(bk.view._scale(), 5))
+    check("every spread is drawn at the same scale",
+          len(set(scales)) == 1, str(scales))
+
+    def worst_overflow():
+        worst = -1e9
+        for i in range(bk.view.count()):
+            # measure each spread where it actually comes to rest, which for a
+            # lone back cover is the middle of the window, not the spine
+            bk.view._anim.stop()
+            bk.view._turn_dir = 0
+            bk.view.spread = i
+            bk.view._sync_slide(animate=False)
+            lr, rr, _l, _r = bk.view._rects_for(i)
+            for r in (lr, rr):
+                if r.width() <= 0:
+                    continue
+                worst = max(worst, -r.left(), -r.top(),
+                            r.right() - bk.view.width(),
+                            r.bottom() - bk.view.height())
+        return worst
+
+    for w, h in ((1100, 760), (620, 900), (1400, 460)):
+        bk.resize(w, h)
+        pump(0.15)
+        check(f"the pages fit a {w}x{h} window", worst_overflow() <= 0,
+              f"{worst_overflow():+.0f} px over")
+    bk.resize(1100, 760)
+    pump(0.15)
+
+    # where the two covers stand: page one on the right of the spine, the way a
+    # book falls open; the back cover, with nothing beside it, eases across to
+    # the middle of the window instead of jumping there
+    bk.chk_cover.setChecked(True)
+    pump(0.2)
+    bk.view._anim.stop()
+    bk.view._turn_dir = 0
+    bk.view.spread = 0
+    bk.view._sync_slide(animate=False)
+    lr, rr, _l, _r = bk.view._rects_for(0)
+    check("the cover stands on the right of the spine",
+          not lr.width() and rr.width()
+          and abs(rr.left() - bk.view.spine_x()) < 1.0
+          and rr.center().x() > bk.view.width() / 2,
+          f"{rr.left():.0f}..{rr.right():.0f}, spine {bk.view.spine_x():.0f}")
+
+    last = bk.view.count() - 1
+    if bk.view._lone_left(last) is not None:
+        bk.view.spread = last
+        bk.view._slide_anim.stop()
+        bk.view._slide_ref = bk.view._lone_left(last)
+        travel = []
+        for t in (0.0, 0.5, 1.0):
+            bk.view._slide = t
+            travel.append(bk.view._rects_for(last)[0].center().x())
+        check("the back cover travels, it does not jump",
+              travel[0] < travel[1] < travel[2],
+              " -> ".join(f"{x:.0f}" for x in travel))
+        bk.view._sync_slide(animate=False)
+        cx = bk.view._rects_for(last)[0].center().x()
+        check("and comes to rest in the middle of the window",
+              abs(cx - bk.view.width() / 2) < 1.5,
+              f"{cx:.0f} vs {bk.view.width() / 2:.0f}")
+        # arriving at it from the previous spread animates the slide
+        bk.view._anim.stop()
+        bk.view._slide_anim.stop()
+        bk.view._turn_dir = 0
+        bk.view._slide = 0.0
+        bk.view.spread = last - 1
+        bk.view.next_spread()
+        check("reaching the back cover starts the slide, not a snap",
+              bk.view._slide_anim.state() == QAbstractAnimation.Running
+              and bk.view._slide < 0.5,
+              f"slide {bk.view._slide:.2f}")
+        pump(0.8)
+        check("and the slide finishes", abs(bk.view._slide - 1.0) < 1e-3,
+              f"{bk.view._slide:.2f}")
+        bk.view._anim.stop()
+        bk.view._turn_dir = 0
+
+    # clicking a page turns it: the left page back, the right page on.  The
+    # cover goes back on so the middle spread is a real facing pair, and the
+    # rectangles are measured again before each click - they move with the
+    # spread, and a stale one would land on the wrong side of the spine.
+    bk.chk_cover.setChecked(True)
+    pump(0.2)
+
+    def click_page(spread, side):
+        bk.view._anim.stop()
+        bk.view._turn_dir = 0
+        bk.view.spread = spread
+        pump(0.05)
+        lr, rr, _l, _r = bk.view._rects_for(spread)
+        assert lr.width() and rr.width(), f"spread {spread} is not a pair"
+        at = (lr if side == "left" else rr).center()
+        bk.view.mousePressEvent(QMouseEvent(
+            QEvent.MouseButtonPress, QPointF(at), Qt.LeftButton,
+            Qt.LeftButton, Qt.NoModifier))
+        return bk.view.spread
+
+    pair = next((i for i in range(bk.view.count())
+                 if all(p is not None for p in bk.view.spreads()[i])), None)
+    check("the book has a facing pair to click", pair is not None, str(pair))
+    if pair is not None:
+        got = click_page(pair, "left")
+        check("clicking the left page goes back", got == pair - 1, str(got))
+        got = click_page(pair, "right")
+        check("clicking the right page goes on", got == pair + 1, str(got))
+        pump(0.5)
+
+    # a turn is one sheet: its front closes onto the spine, its back opens out
+    bk.view._anim.stop()
+    bk.view._turn_dir = 0
+    bk.view.spread = 1
+    bk.view.next_spread()
+    check("turning a page animates", bk.view._turning)
+    check("and knows which two spreads it is between",
+          (bk.view._turn_from, bk.view._turn_to) == (1, 2),
+          f"{bk.view._turn_from} -> {bk.view._turn_to}")
+    seen = set()
+    for t in (0.1, 0.3, 0.5, 0.7, 0.9):
+        bk.view._turn_t = t
+        seen.add(nonblank(paint(bk.view)))
+    check("every phase of the turn draws", seen == {True}, str(seen))
+    bk.view._anim.stop()
+    bk.view._turn_dir = 0
+    bk.view._turn_t = 0.0
+    bk.view.spread = 0
+    bk.view.go(bk.view.count() - 1, animate=False)
+    check("a jump across the book does not animate", not bk.view._turning)
+
     bk.close()
     pump()
 
