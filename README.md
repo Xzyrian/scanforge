@@ -12,6 +12,32 @@ and applied once, at export.
 
 ---
 
+## This is slopcode
+
+**ScanForge was written by an LLM, essentially in full.** All 11,300 lines of
+the application and 3,700 lines of tests came out of Claude, working from my
+descriptions of what I wanted and my reports of what was broken. I directed it
+and I use it daily on real scans. I did not write it, and I have not read most
+of it.
+
+Take that for what it is worth:
+
+* It works on my documents, and the test suites are real — they build actual
+  10000 × 14000 scans and check the output pixel by pixel, and they pass.
+* The reasoning in [docs/design-notes.md](docs/design-notes.md) is the argument
+  as it was actually had, usually after something went wrong. It is not
+  retrospective justification.
+* Nobody has reviewed fifteen thousand lines line by line. There will be bugs
+  nobody has hit yet, there is no security story worth the name, and if it
+  loses a project file you have my sympathy and not much else.
+
+The one thing worth relying on: **your scans are never written to.** Every crop,
+angle and blur is recorded in a separate project file, and the exporter only
+ever writes new files somewhere else. That is a design property with tests
+behind it, not a promise about the code quality.
+
+---
+
 ## What it does
 
 * **Non-destructive.** Your scans are never written to. A project file records
