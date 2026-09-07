@@ -6,6 +6,13 @@ wrong thing — so each one says what the behaviour replaced as well as what it
 is. The [README](../README.md) covers what the application does; this covers
 why.
 
+> **This is slopcode.** The application was written by an LLM, essentially in
+> full — see [the note in the README](../README.md#this-is-slopcode). These
+> notes are the reasoning behind the decisions, written down as they were made.
+> They are worth reading if you want to understand or change the program. They
+> are not a claim that the code implementing any of it has been reviewed by a
+> human, because it has not.
+
 ---
 
 ## Contents
@@ -285,11 +292,12 @@ first so it is not hidden underneath it.
 ## The page grid
 
 **Reordering does not use the system's drag and drop.** Handing the job to the
-platform meant the drop was resolved somewhere that could not be seen or tested;
-it passed a synthetic test and kept failing in the actual application. A reorder
-is now an ordinary mouse gesture on the list, which the test suite can drive end
-to end. Dropping *files* from Explorer is still real drag and drop — that is the
-only thing the platform is asked to do.
+platform meant the drop was resolved somewhere the application could not see
+into: it behaved correctly in isolation and kept failing in use, with no way to
+observe why. A reorder is now an ordinary mouse gesture on the list, which the
+application handles itself and can therefore inspect. Dropping *files* from
+Explorer is still real drag and drop — that is the only thing the platform is
+asked to do.
 
 When you drag far enough, the pages you picked up are lifted out of the list, a
 faded copy follows the cursor, and a blank slot opens where they will land.

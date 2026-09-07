@@ -14,27 +14,25 @@ and applied once, at export.
 
 ## This is slopcode
 
-**ScanForge was written by an LLM, essentially in full.** All 11,300 lines of
-the application and 3,700 lines of tests came out of Claude, working from my
-descriptions of what I wanted and my reports of what was broken. I directed it
-and I use it daily on real scans. I did not write it, and I have not read most
-of it.
+**ScanForge was written by an LLM, essentially in full.** All 11,300 lines of it
+came out of Claude, working from my descriptions of what I wanted and my reports
+of what was broken. I directed it and I use it daily on real scans. I did not
+write it, and I have not read most of it.
 
 Take that for what it is worth:
 
-* It works on my documents, and the test suites are real — they build actual
-  10000 × 14000 scans and check the output pixel by pixel, and they pass.
+* It works on my documents. That is the whole of the evidence.
 * The reasoning in [docs/design-notes.md](docs/design-notes.md) is the argument
   as it was actually had, usually after something went wrong. It is not
   retrospective justification.
-* Nobody has reviewed fifteen thousand lines line by line. There will be bugs
+* Nobody has reviewed eleven thousand lines line by line. There will be bugs
   nobody has hit yet, there is no security story worth the name, and if it
   loses a project file you have my sympathy and not much else.
 
 The one thing worth relying on: **your scans are never written to.** Every crop,
 angle and blur is recorded in a separate project file, and the exporter only
-ever writes new files somewhere else. That is a design property with tests
-behind it, not a promise about the code quality.
+ever writes new files somewhere else. That is how it is built, which is a
+different thing from a promise about the code quality.
 
 ---
 
@@ -95,7 +93,7 @@ Measured on a 2-core container; your machine will be quicker.
 3. Double-click **`run.bat`**.
 
 `run-console.bat` is the same but leaves a console open, which is what you want
-if something goes wrong. `run-tests.bat` runs the test suites.
+if something goes wrong.
 
 To make a copy for someone without Python, run **`build-exe.bat`** — see
 [Building an executable](#building-an-executable) below.
@@ -314,7 +312,7 @@ send it to unzips it and runs the exe, with no Python on their machine.
 | Argument | Effect |
 | --- | --- |
 | `onefile` | One self-contained exe instead of a folder. Smaller to send, but it unpacks itself on every launch, so it starts several seconds slower. |
-| `quick` | Skip the source self-test, if you have just run `run-tests.bat`. |
+| `quick` | Skip the source self-test and go straight to building. |
 | `nopause` | Don't wait for a keypress, for calling from another script. |
 
 Expect roughly 300 MB unpacked, most of it Qt, OpenCV and the TIFF codecs. The
@@ -356,11 +354,8 @@ scanforge/
     size_match_dialog.py grouping near-identical crops onto one exact size
     export_dialog.py
     main_window.py
-tests/
-  test_pipeline.py geometry, render, detection, export, on synthetic 600 dpi scans
-  test_ui.py       headless widget tests - builds the window, drives it, paints it
 tools/
-  freeze_check.py  the self-test that also runs inside the built executable
+  freeze_check.py  the self-test that runs inside the built executable
   decode_report.py what a given scan's import actually did, and why
   screenshot.py    regenerates the picture at the top of this file
   make_icon.py     writes the multi-resolution .ico for the build
@@ -378,25 +373,6 @@ OpenCV export warp are built from it, which is why they cannot drift apart.
 Angle convention: **positive is clockwise**, matching Qt. The auto-detect
 functions return the *correction* to apply, so their result goes straight into
 `PageEdit.angle`.
-
-### Tests
-
-`run-tests.bat` runs three things: the pipeline suite, the UI suite, and the
-self-test.
-
-The pipeline suite builds a real 10000 × 14000 scan and checks that the fast
-crop-before-rotate path is pixel-identical to the naive rotate-then-slice path,
-that a known 0.37° skew is recovered exactly, that 16-bit and greyscale survive
-the round trip, that the size shown in the inspector is the size that lands on
-disk, and that cuts and joins survive a save and reload with their alignment
-intact.
-
-The UI suite builds the real window offscreen and drives it: that a stray drag
-in cursor mode can't destroy a crop, that the crop tools release themselves,
-that a crop-all reaches every page, that undo restores a removed page and a
-whole-project change, that reordering and sorting behave, that the naming
-produces `Sony_KV-16G1_0001.tif` and `Sony_KV-16G1.pdf`, and that the spread
-view puts two pages edge to edge.
 
 ---
 
