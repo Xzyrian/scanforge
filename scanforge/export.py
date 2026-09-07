@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace, field
 from threading import Event
 from typing import Callable, Optional
 
@@ -43,6 +44,11 @@ class ExportSettings:
     subfolder_per_doc: bool = False
     overwrite: bool = False
     zip_images: bool = True                # <document>-images.zip beside them
+    # A project file already records every crop and angle against the untouched
+    # scans, so the per-page exports are a means to an end more often than the
+    # end itself.  Off by default: produce the ZIP and the PDF, and don't leave
+    # a few gigabytes of cropped TIFFs behind that nothing reads.
+    keep_images: bool = False
     make_pdf: bool = False
     pdf_dpi: float = 0.0                   # 0 means "match the source scans"
     pdf_quality: int = 88
@@ -272,12 +278,24 @@ class BatchExporter:
         total = len(self.edits)
         done = 0
 
+        # The zip and the PDF are both assembled from the exported files on
+        # disk, so "don't keep the images" cannot mean "don't write them" - it
+        # means write them somewhere temporary, in the destination folder so
+        # the writes stay on one filesystem, and take them away afterwards.
+        scratch = ""
+        page_cfg = cfg
+        if not cfg.keep_images and (cfg.zip_images or cfg.make_pdf):
+            os.makedirs(cfg.out_dir or ".", exist_ok=True)
+            scratch = tempfile.mkdtemp(prefix=".scanforge-export-",
+                                       dir=cfg.out_dir or ".")
+            page_cfg = replace(cfg, out_dir=scratch, overwrite=True)
+
         # one document, so page numbers simply run 1..n in queue order
         jobs = [(e, i + 1) for i, e in enumerate(self.edits)]
 
         from concurrent.futures import as_completed
         with ThreadPoolExecutor(max_workers=max(1, cfg.workers)) as pool:
-            futures = {pool.submit(export_one, e, cfg, i, self.cancel): e
+            futures = {pool.submit(export_one, e, page_cfg, i, self.cancel): e
                        for e, i in jobs}
             for fut in as_completed(futures):
                 res = fut.result()
@@ -294,7 +312,33 @@ class BatchExporter:
             self._zip_images()
         if cfg.make_pdf and not self.cancel.is_set():
             self._build_pdfs()
+        if scratch:
+            self._discard_scratch(scratch)
         return self.results
+
+    def _discard_scratch(self, scratch: str) -> None:
+        """Take away the per-page files once the zip and the PDF have them.
+
+        The results keep pointing at where each page *was*: they are what the
+        progress window lists and totals, and a run that produced eight hundred
+        pages should still say so.  Only the files go.
+        """
+        import shutil
+        kept = sum(1 for r in self.results if r.ok)
+        try:
+            shutil.rmtree(scratch, ignore_errors=True)
+        except Exception:                              # noqa: BLE001
+            pass
+        if self.on_message and kept:
+            what = []
+            if self.cfg.zip_images:
+                what.append("the zip")
+            if self.cfg.make_pdf:
+                what.append("the PDF")
+            self.on_message(
+                f"{kept} page files went into {' and '.join(what)} and were "
+                f"then discarded — tick \"Keep the individual page files\" to "
+                f"keep them")
 
     def _zip_images(self) -> None:
         """Bundle the exported pages for sending. The PDF stays out of it."""

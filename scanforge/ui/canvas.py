@@ -20,11 +20,17 @@ from PySide6.QtGui import (QBrush, QColor, QCursor, QImage, QPainter, QPen,
 from PySide6.QtWidgets import QGraphicsScene, QGraphicsView
 
 from ..geometry import (Rect, apply_affine, invert_affine, rotation_matrix,
-                        rotated_size, angle_from_line)
+                        rotated_size)
 from ..model import PageEdit
 
 HANDLE_PX = 9.0
 EDGE_PX = 7.0
+
+# The inch grid, as (colour, width in screen pixels).  It was one hairline at
+# alpha 55, which against a scan is the same as not being drawn at all - and a
+# measuring aid you cannot see is worse than none, because you think you
+# checked.  Named rather than inlined so it can be measured.
+GRID_PEN = (QColor(0, 255, 200, 110), 2.0)
 
 
 class Tool(str, Enum):
@@ -33,19 +39,23 @@ class Tool(str, Enum):
     handles.  It cannot start a new rectangle, so a stray click on the page can
     never wipe out framing you already set.
 
-    CROP, ALIGN, BLUR and CUT are one-shot - they do their thing once and hand
-    control back to CURSOR, which is why you have to arm them deliberately.
+    CROP, CROP_ALL, BLUR and CUT are one-shot - they do their thing once and
+    hand control back to CURSOR, which is why you have to arm them deliberately.
+
+    CROP and CROP_ALL draw the same rectangle; they differ only in how far it
+    reaches.  Cropping one page and cropping the whole document are different
+    intentions, and asking for them with different tools is more honest than a
+    mode toggle that silently changes what the next drag means.
     """
     CURSOR = "cursor"
     CROP = "crop"
-    ALIGN = "align"
+    CROP_ALL = "crop_all"
     BLUR = "blur"
     CUT = "cut"
     PAN = "pan"
 
     # kept so older projects and any external callers still resolve
     SELECT = "cursor"
-    STRAIGHTEN = "align"
 
 
 def qtransform_from_affine(M: np.ndarray) -> QTransform:
@@ -104,7 +114,10 @@ class Canvas(QGraphicsView):
     # cut is one request carrying several positions, not several requests: the
     # second one would otherwise land on a page the first had already replaced.
     cutRequested = Signal(str, object)
-    guideChanged = Signal()              # the alignment guide moved or cleared
+    zoomChanged = Signal(float)          # percent of full-resolution pixels
+    cropDrawn = Signal(bool)             # a crop was drawn; True = every page
+    pageChanged = Signal()               # a page arrived, or the canvas emptied
+    filesDropped = Signal(list)          # scans or a project dropped on the page
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -118,6 +131,7 @@ class Canvas(QGraphicsView):
         self.setFocusPolicy(Qt.StrongFocus)
         self.setBackgroundBrush(QColor(38, 40, 44))
         self.setFrameShape(QGraphicsView.NoFrame)
+        self.setAcceptDrops(True)
 
         self.edit: Optional[PageEdit] = None
         self._pix: Optional[QPixmap] = None
@@ -130,23 +144,14 @@ class Canvas(QGraphicsView):
         self.tool = Tool.CURSOR
         self.show_grid = False
         self.grid_inches = 0.5
-        self.show_thirds = True
         self.dim_outside = True
         self.guides_h: list = []         # scene y
         self.guides_v: list = []         # scene x
         self.lock_aspect: Optional[float] = None
 
         self._drag = None                # (kind, data)
-        # The alignment guide, in VIEWPORT pixels - fixed to the editor window,
-        # not to the page.  It is a straightedge held against the screen: the
-        # page turns, pans and zooms underneath it while the guide stays
-        # exactly where it was put.  Storing it in scene coordinates instead
-        # made it drift, because the scene grows as the page rotates and the
-        # guide moved with the frame it was supposed to be measuring.
-        self.align_line: Optional[tuple] = None      # (x1, y1, x2, y2), viewport px
-        self.align_axis: str = ""        # "h", "v" or "" for a free angle
         self._cut = None                 # (axis, scene position) while placing
-        self._space = False
+        self._drew_for_all = False       # the crop being drawn is for every page
         self._fast_draw = False
         self._overlay_pages: list = []   # extra (pixmap, transform, rect) for spread view
         self._message = "Open a folder of scans to begin"
@@ -168,10 +173,6 @@ class Canvas(QGraphicsView):
             p.setFont(f)
             p.drawText(self.viewport().rect(), Qt.AlignCenter, self._message)
             p.end()
-        if self.align_line is not None:
-            p = QPainter(self.viewport())
-            self._draw_guide(p)
-            p.end()
 
     def set_page(self, edit: Optional[PageEdit], proxy: Optional[np.ndarray]) -> None:
         self.edit = edit
@@ -179,6 +180,7 @@ class Canvas(QGraphicsView):
             self._pix = None
             self.scene().setSceneRect(QRectF(0, 0, 1, 1))
             self.viewport().update()
+            self.pageChanged.emit()
             return
         self._message = ""
         self._pix = numpy_to_pixmap(proxy)
@@ -190,6 +192,7 @@ class Canvas(QGraphicsView):
         self._scale = self._ref_size[0] / float(bw) if bw else 1.0
         self._update_scene_rect()
         self.fit()
+        self.pageChanged.emit()
 
     def set_detail_pixmap(self, arr: Optional[np.ndarray]) -> None:
         """Swap in a higher-resolution tier without changing scene coordinates."""
@@ -320,124 +323,6 @@ class Canvas(QGraphicsView):
             self.editChanged.emit()
         self.viewport().update()
 
-    # ------------------------------------------------------- alignment guide
-    def guide_view_points(self) -> Optional[tuple]:
-        """The guide in viewport pixels - where it actually lives."""
-        if self.align_line is None:
-            return None
-        x1, y1, x2, y2 = self.align_line
-        return QPointF(x1, y1), QPointF(x2, y2)
-
-    def guide_points(self) -> Optional[tuple]:
-        """The guide mapped into scene coordinates, for anything that needs to
-        know where on the page it currently lies.
-
-        The view transform is a scale and a translation with no rotation, so
-        mapping the two ends is exact and the angle is the same in either space.
-        """
-        pts = self.guide_view_points()
-        if pts is None:
-            return None
-        # via the transform rather than mapToScene(), which takes whole pixels:
-        # at a fitted zoom one viewport pixel is several scene pixels, and
-        # rounding the ends there would put a visible bend in a guide that is
-        # exactly level
-        inv, ok = self.viewportTransform().inverted()
-        if not ok:
-            return (self.mapToScene(pts[0].toPoint()),
-                    self.mapToScene(pts[1].toPoint()))
-        return inv.map(pts[0]), inv.map(pts[1])
-
-    def set_guide_points(self, a: QPointF, b: QPointF, axis: str = "") -> None:
-        """Place the guide, given points in VIEWPORT coordinates."""
-        self.align_line = (a.x(), a.y(), b.x(), b.y())
-        self.align_axis = axis
-        # Scrolling normally blits the existing pixels and repaints only the
-        # newly exposed strip.  An overlay fixed to the viewport would smear
-        # across the page that way, so while a guide exists the whole viewport
-        # is repainted.
-        self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
-        self.viewport().update()
-        self.guideChanged.emit()
-
-    def set_guide_scene_points(self, a: QPointF, b: QPointF, axis: str = "") -> None:
-        """Place the guide from scene coordinates, for callers that think in
-        page pixels."""
-        m = self.viewportTransform()
-        self.set_guide_points(m.map(a), m.map(b), axis)
-
-    def clear_guide(self) -> None:
-        self.align_line = None
-        self.align_axis = ""
-        self.setViewportUpdateMode(QGraphicsView.SmartViewportUpdate)
-        self.viewport().update()
-        self.guideChanged.emit()
-
-    def guide_angle(self) -> float:
-        """How far the guide sits from the axis it is closest to, in degrees."""
-        pts = self.guide_view_points()
-        if pts is None:
-            return 0.0
-        a, b = pts
-        return -angle_from_line(a.x(), a.y(), b.x(), b.y())
-
-    def _snapped(self, a: QPointF, b: QPointF, mods) -> tuple:
-        """Pull a nearly-level guide onto the axis unless Alt says otherwise.
-
-        A straightedge that is itself a fifth of a degree out is worse than no
-        straightedge at all, because you would align the page to the error.
-        """
-        if mods & Qt.AltModifier:
-            return b, ""
-        off = angle_from_line(a.x(), a.y(), b.x(), b.y())
-        if abs(off) > 1.5:
-            return b, ""
-        dx, dy = b.x() - a.x(), b.y() - a.y()
-        if abs(dx) >= abs(dy):
-            return QPointF(b.x(), a.y()), "h"
-        return QPointF(a.x(), b.y()), "v"
-
-    def rotate_page_to_guide(self) -> float:
-        """Turn the page so the guide's own inclination becomes level.
-
-        Only meaningful when the guide was traced along a crooked feature; a
-        guide snapped to the axis has nothing to correct, and says so.
-        """
-        pts = self.guide_view_points()
-        if pts is None or self.edit is None:
-            return 0.0
-        a, b = pts
-        delta = angle_from_line(a.x(), a.y(), b.x(), b.y())
-        if abs(delta) < 1e-4:
-            self.statusMessage.emit(
-                "The guide is already level — rotate the page to meet it with "
-                "[ and ], or draw the guide along a crooked feature instead")
-            return 0.0
-        self.interactionStarted.emit("Rotate to guide")
-        self.apply_angle_delta(delta)
-        self.interactionEnded.emit()
-        return delta
-
-    def _hit_guide(self, pos: QPointF) -> Optional[str]:
-        """`pos` is in viewport pixels, like the guide itself, so the grab
-        tolerance is a constant number of screen pixels at any zoom."""
-        pts = self.guide_view_points()
-        if pts is None:
-            return None
-        a, b = pts
-        if math.hypot(pos.x() - a.x(), pos.y() - a.y()) <= HANDLE_PX:
-            return "guide_a"
-        if math.hypot(pos.x() - b.x(), pos.y() - b.y()) <= HANDLE_PX:
-            return "guide_b"
-        # distance from the segment
-        vx, vy = b.x() - a.x(), b.y() - a.y()
-        L2 = vx * vx + vy * vy
-        if L2 < 1e-9:
-            return None
-        t = max(0.0, min(1.0, ((pos.x() - a.x()) * vx + (pos.y() - a.y()) * vy) / L2))
-        d = math.hypot(pos.x() - (a.x() + t * vx), pos.y() - (a.y() + t * vy))
-        return "guide_move" if d <= EDGE_PX else None
-
     def view_scale(self) -> float:
         return math.sqrt(abs(self.transform().determinant())) or 1.0
 
@@ -453,6 +338,8 @@ class Canvas(QGraphicsView):
 
     # ------------------------------------------------------------------ zoom
     def fit(self) -> None:
+        if self.edit is None or self._pix is None:
+            return
         W, H = self.page_canvas()
         if W <= 0:
             return
@@ -465,6 +352,8 @@ class Canvas(QGraphicsView):
 
     def zoom_to(self, factor_of_source: float) -> None:
         """1.0 means one screen pixel per full-resolution source pixel."""
+        if self.edit is None or self._pix is None:
+            return
         target = factor_of_source * self._scale
         cur = self.view_scale()
         if cur > 0:
@@ -472,6 +361,11 @@ class Canvas(QGraphicsView):
         self._announce_zoom()
 
     def zoom_by(self, f: float, anchor: Optional[QPointF] = None) -> None:
+        # There is nothing to make bigger before a page is open, and a view
+        # transform applied to an empty scene sticks: the first page then
+        # arrives at whatever magnification the empty canvas was left at.
+        if self.edit is None or self._pix is None:
+            return
         if anchor is None:
             anchor = QPointF(self.viewport().rect().center())
         before = self.mapToScene(anchor.toPoint())
@@ -481,16 +375,39 @@ class Canvas(QGraphicsView):
         self.translate(d.x(), d.y())
         self._announce_zoom()
 
+    def zoom_percent(self) -> float:
+        """Where the view sits, as a percentage of full-resolution pixels."""
+        return 100.0 * self.view_scale() / (self._scale or 1.0)
+
+    def set_zoom_percent(self, pct: float, anchor=None) -> None:
+        cur = self.zoom_percent()
+        if cur <= 0 or pct <= 0:
+            return
+        self.zoom_by(pct / cur, anchor)
+
     def _announce_zoom(self) -> None:
-        pct = 100.0 * self.view_scale() / (self._scale or 1.0)
-        self.statusMessage.emit(f"Zoom {pct:.0f}%")
+        self.zoomChanged.emit(self.zoom_percent())
 
     def wheelEvent(self, ev):
-        delta = ev.angleDelta().y()
-        if not delta:
+        """Ctrl zooms, Shift scrolls across, and a bare wheel scrolls down.
+
+        The wheel used to zoom on its own, which is the one binding that makes a
+        long page hard to read: every attempt to move down it changed the
+        magnification instead, and there is no way to scroll by accident.
+        """
+        delta = ev.angleDelta().y() or ev.angleDelta().x()
+        if not delta or self.edit is None or self._pix is None:
             return
-        f = 1.0015 ** delta
-        self.zoom_by(f, QPointF(ev.position()))
+        mods = ev.modifiers()
+        if mods & Qt.ControlModifier:
+            self.zoom_by(1.0015 ** delta, QPointF(ev.position()))
+            ev.accept()
+            return
+        bar = (self.horizontalScrollBar() if mods & Qt.ShiftModifier
+               else self.verticalScrollBar())
+        # a notch is 120 eighths of a degree; three lines is the usual step
+        bar.setValue(bar.value() - int(round(delta / 120.0 * 3 * bar.singleStep()
+                                             or delta / 4.0)))
         ev.accept()
 
     # ------------------------------------------------------------------ paint
@@ -561,15 +478,6 @@ class Canvas(QGraphicsView):
         if self.show_grid:
             self._draw_grid(painter, crop, px)
 
-        if self.show_thirds and self.edit.crop is not None:
-            pen = QPen(QColor(255, 255, 255, 70), px)
-            painter.setPen(pen)
-            for i in (1, 2):
-                x = crop.left() + crop.width() * i / 3.0
-                y = crop.top() + crop.height() * i / 3.0
-                painter.drawLine(QPointF(x, crop.top()), QPointF(x, crop.bottom()))
-                painter.drawLine(QPointF(crop.left(), y), QPointF(crop.right(), y))
-
         # guides
         gpen = QPen(QColor(0, 210, 255, 200), px * 1.2)
         painter.setPen(gpen)
@@ -610,50 +518,6 @@ class Canvas(QGraphicsView):
 
         self._draw_cut(painter, crop, px)
 
-    def _draw_guide(self, painter: QPainter) -> None:
-        """The straightedge you align the page to, drawn in viewport pixels.
-
-        It is painted over the viewport rather than into the scene because it
-        belongs to the editor, not to the page: it must not scale with the zoom
-        or shift when the page canvas grows under a rotation.
-
-        Deliberately heavy - it is a reference the eye has to judge sub-degree
-        differences against, and a hairline cannot do that - with a dark casing
-        so it reads over white paper and black type alike, and a faint dashed
-        extension across the whole view so alignment can be judged far from the
-        segment that was actually drawn.
-        """
-        pts = self.guide_view_points()
-        if pts is None:
-            return
-        a, b = pts
-        dx, dy = b.x() - a.x(), b.y() - a.y()
-        L = math.hypot(dx, dy)
-        if L < 1e-6:
-            return
-        ux, uy = dx / L, dy / L
-        far = float(max(self.viewport().width(), self.viewport().height())) * 2.0
-        ext_a = QPointF(a.x() - ux * far, a.y() - uy * far)
-        ext_b = QPointF(b.x() + ux * far, b.y() + uy * far)
-
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.setBrush(Qt.NoBrush)
-        painter.setPen(QPen(QColor(0, 0, 0, 90), 1.2, Qt.DashLine))
-        painter.drawLine(ext_a, ext_b)
-        painter.setPen(QPen(QColor(80, 230, 255, 110), 1.0, Qt.DashLine))
-        painter.drawLine(ext_a, ext_b)
-
-        painter.setPen(QPen(QColor(0, 0, 0, 170), 5.0, Qt.SolidLine, Qt.FlatCap))
-        painter.drawLine(a, b)
-        painter.setPen(QPen(QColor(80, 230, 255), 3.0, Qt.SolidLine, Qt.FlatCap))
-        painter.drawLine(a, b)
-
-        r = HANDLE_PX * 0.6
-        painter.setBrush(QBrush(QColor(255, 255, 255)))
-        painter.setPen(QPen(QColor(20, 30, 40), 1.0))
-        painter.drawEllipse(a, r, r)
-        painter.drawEllipse(b, r, r)
-
     def _draw_cut(self, painter: QPainter, crop: QRectF, px: float) -> None:
         if self._cut is None:
             return
@@ -672,7 +536,8 @@ class Canvas(QGraphicsView):
         step = self.grid_inches * dpi * self._scale
         if step < 6:
             return
-        painter.setPen(QPen(QColor(0, 255, 200, 55), px))
+        colour, width = GRID_PEN
+        painter.setPen(QPen(colour, px * width))
         x = crop.left()
         while x < crop.right():
             painter.drawLine(QPointF(x, crop.top()), QPointF(x, crop.bottom()))
@@ -695,20 +560,13 @@ class Canvas(QGraphicsView):
                        Qt.SizeBDiagCursor, Qt.SizeHorCursor]
 
     def _hit(self, scene_pos: QPointF):
-        # With no crop set, crop_scene() reports the whole page, and hit-testing
-        # against it claimed every click as "move the crop" - so the crop tool
-        # could never draw the *first* rectangle on a fresh page.
-        if self.edit is not None and self.edit.crop is None:
-            px = 1.0 / (self.view_scale() or 1.0)
-            gt = EDGE_PX * px
-            for y in self.guides_h:
-                if abs(scene_pos.y() - y) <= gt:
-                    return "guide_h", y
-            for x in self.guides_v:
-                if abs(scene_pos.x() - x) <= gt:
-                    return "guide_v", x
-            return None, None
         crop = self.crop_scene()
+        # A page with no crop of its own still shows a crop window - the whole
+        # sheet - and its edges are draggable, because that is how cropping a
+        # scan starts: pull the frame in from the edges.  What such a page must
+        # *not* offer is "move", which would claim every click on the page and
+        # leave the crop tool no way to draw a fresh rectangle inside it.
+        blank = self.edit is not None and self.edit.crop is None
         px = 1.0 / (self.view_scale() or 1.0)
         tol = HANDLE_PX * px
         for i, (hx, hy) in enumerate(self._handle_points(crop)):
@@ -721,14 +579,14 @@ class Canvas(QGraphicsView):
         for x in self.guides_v:
             if abs(scene_pos.x() - x) <= gt:
                 return "guide_v", x
-        if crop.adjusted(-tol, -tol, tol, tol).contains(scene_pos):
+        if not blank and crop.adjusted(-tol, -tol, tol, tol).contains(scene_pos):
             return "move", None
         return None, None
 
     # ------------------------------------------------------------------ mouse
     def mousePressEvent(self, ev):
         pos = self.mapToScene(ev.position().toPoint())
-        if ev.button() == Qt.MiddleButton or self._space or self.tool == Tool.PAN:
+        if ev.button() == Qt.MiddleButton or self.tool == Tool.PAN:
             self._drag = ("pan", [QPointF(ev.position()), QPointF(0.0, 0.0)])
             self._fast_draw = True
             self.setCursor(Qt.ClosedHandCursor)
@@ -736,30 +594,11 @@ class Canvas(QGraphicsView):
         if ev.button() != Qt.LeftButton:
             return super().mousePressEvent(ev)
 
-        if self.tool == Tool.ALIGN:
-            vp = QPointF(ev.position())
-            self.set_guide_points(vp, vp)
-            self._drag = ("guide_new", vp)
-            self.viewport().update()
-            return
-
         if self.tool == Tool.CUT:
             self._cut = self._cut_at(pos, ev.modifiers())
             self._drag = ("cut", None)
             self.viewport().update()
             return
-
-        # The guide sits on top of everything and is thin in one direction, so
-        # it gets first refusal on a click - but only in cursor mode.  With
-        # another tool armed the intent is not in doubt, and a guide lying
-        # across the page must not swallow the crop you meant to draw.
-        if self.tool == Tool.CURSOR:
-            vp = QPointF(ev.position())
-            hit = self._hit_guide(vp)
-            if hit is not None:
-                a, b = self.guide_view_points()
-                self._drag = (hit, (vp, a, b))
-                return
 
         if self.tool == Tool.BLUR:
             self.interactionStarted.emit("Add blur")
@@ -789,9 +628,12 @@ class Canvas(QGraphicsView):
             self.viewport().update()
 
         kind, data = self._hit(pos)
-        # An armed crop tool always draws; adjusting an existing rectangle is
-        # what the cursor is for.
-        if self.tool == Tool.CROP and kind not in ("guide_h", "guide_v"):
+        # An armed crop tool draws a new rectangle rather than sliding the one
+        # that is there - but a grab on a handle is not ambiguous, in either
+        # tool.  Pulling the frame in from the edge of the sheet is how a scan
+        # gets cropped; making the crop tool ignore the handles meant a fresh
+        # page could only be cropped by drawing a rectangle freehand.
+        if self.tool in (Tool.CROP, Tool.CROP_ALL) and kind == "move":
             kind = None
         self._fast_draw = True
         if kind in ("guide_h", "guide_v"):
@@ -802,8 +644,10 @@ class Canvas(QGraphicsView):
         elif kind:
             self.interactionStarted.emit("Resize crop")
             self._drag = ("resize", (kind, self.crop_scene(), pos))
-        elif self.tool == Tool.CROP:
-            self.interactionStarted.emit("Draw crop")
+        elif self.tool in (Tool.CROP, Tool.CROP_ALL):
+            self.interactionStarted.emit(
+                "Crop every page" if self.tool == Tool.CROP_ALL else "Draw crop")
+            self._drew_for_all = self.tool == Tool.CROP_ALL
             # remember what was there: a click without a drag must not commit a
             # one-pixel crop, which with the shared crop on would go to every
             # page in the project
@@ -822,7 +666,7 @@ class Canvas(QGraphicsView):
         self.cursorMoved.emit(sx, sy)
 
         if self._drag is None:
-            if self.tool in (Tool.ALIGN, Tool.BLUR):
+            if self.tool == Tool.BLUR:
                 self.setCursor(Qt.CrossCursor)
                 return
             if self.tool == Tool.CUT:
@@ -831,12 +675,6 @@ class Canvas(QGraphicsView):
                 self._announce_cut()
                 self.viewport().update()
                 return
-            if self.tool == Tool.CURSOR:
-                hit = self._hit_guide(QPointF(ev.position()))
-                if hit is not None:
-                    self.setCursor(Qt.SizeAllCursor if hit == "guide_move"
-                                   else Qt.CrossCursor)
-                    return
             bi, bhandle = self._hit_blur(pos)
             if bi >= 0:
                 if bhandle == "move":
@@ -877,41 +715,6 @@ class Canvas(QGraphicsView):
                     self.verticalScrollBar().value() - dy)
             self._drag = ("pan", [QPointF(ev.position()),
                                   QPointF(d.x() - dx, d.y() - dy)])
-            return
-        if kind == "guide_new":
-            a = data
-            vp = QPointF(ev.position())
-            if ev.modifiers() & Qt.ShiftModifier:
-                vp = self._constrain(a, vp)
-                axis = "h" if abs(vp.x() - a.x()) >= abs(vp.y() - a.y()) else "v"
-            else:
-                vp, axis = self._snapped(a, vp, ev.modifiers())
-            self.set_guide_points(a, vp, axis)
-            length = (math.hypot(vp.x() - a.x(), vp.y() - a.y())
-                      / (self.view_scale() or 1.0) / (self._scale or 1))
-            off = angle_from_line(a.x(), a.y(), vp.x(), vp.y())
-            self.statusMessage.emit(
-                f"Guide {off:+.3f}° from level   (length {length:.0f} px)"
-                + ("   · snapped" if axis else ""))
-            return
-        if kind in ("guide_a", "guide_b", "guide_move"):
-            start, a0, b0 = data
-            pos = QPointF(ev.position())
-            d = pos - start
-            if kind == "guide_move":
-                self.set_guide_points(a0 + d, b0 + d, self.align_axis)
-            else:
-                moving = (a0 + d) if kind == "guide_a" else (b0 + d)
-                anchor = b0 if kind == "guide_a" else a0
-                if ev.modifiers() & Qt.ShiftModifier:
-                    moving = self._constrain(anchor, moving)
-                    axis = "h" if abs(moving.x() - anchor.x()) >= abs(moving.y() - anchor.y()) else "v"
-                else:
-                    moving, axis = self._snapped(anchor, moving, ev.modifiers())
-                if kind == "guide_a":
-                    self.set_guide_points(moving, b0, axis)
-                else:
-                    self.set_guide_points(a0, moving, axis)
             return
         if kind == "cut":
             self._cut = self._cut_at(pos, ev.modifiers())
@@ -968,19 +771,7 @@ class Canvas(QGraphicsView):
         self.unsetCursor()
         end_group = False
 
-        if kind == "guide_new":
-            pts = self.guide_view_points()
-            a, b = pts if pts else (QPointF(), QPointF())
-            if math.hypot(b.x() - a.x(), b.y() - a.y()) <= 12:
-                # a click, not a drag: no guide rather than a dot
-                self.clear_guide()
-            else:
-                self.statusMessage.emit(
-                    "Guide placed — now rotate the page onto it with [ and ], "
-                    "the angle dial, or Rotate to guide")
-            self.tool = Tool.CURSOR
-            self.toolFinished.emit()
-        elif kind == "cut":
+        if kind == "cut":
             if self._cut is not None:
                 axis, frac = self._cut_fraction()
                 self._cut = None
@@ -992,8 +783,6 @@ class Canvas(QGraphicsView):
                     self.statusMessage.emit(
                         "That cut would leave one side empty — place it "
                         "further in")
-        elif kind in ("guide_a", "guide_b", "guide_move"):
-            pass
         elif kind == "new":
             r = self.crop_scene()
             px = 1.0 / (self.view_scale() or 1.0)
@@ -1006,8 +795,11 @@ class Canvas(QGraphicsView):
                     "Drag out a rectangle to crop — a single click does nothing")
             else:
                 # one crop per arming, so a stray drag cannot overwrite it
+                to_all = getattr(self, "_drew_for_all", False)
                 self.tool = Tool.CURSOR
                 self.toolFinished.emit()
+                self.cropDrawn.emit(bool(to_all))
+            self._drew_for_all = False
             end_group = True
         elif kind == "blur_new":
             i = self.blur_selected
@@ -1080,13 +872,6 @@ class Canvas(QGraphicsView):
         if self.edit is None or parts < 2:
             return
         self.cutRequested.emit(axis, [i / float(parts) for i in range(1, parts)])
-
-    @staticmethod
-    def _constrain(a: QPointF, b: QPointF) -> QPointF:
-        dx, dy = b.x() - a.x(), b.y() - a.y()
-        if abs(dx) >= abs(dy):
-            return QPointF(b.x(), a.y())
-        return QPointF(a.x(), b.y())
 
     def _resized(self, handle: str, orig: QRectF, pos: QPointF, mods) -> QRectF:
         r = QRectF(orig)
@@ -1164,11 +949,19 @@ class Canvas(QGraphicsView):
         self.set_crop_scene(QRectF(0, 0, W, H))
 
     def add_guide(self, horizontal: bool = True) -> None:
+        """Drop a guide across the middle of the *view*, not the page.
+
+        Zoomed in on the top of a scan, a guide placed at the centre of the
+        page lands somewhere off-screen and has to be hunted for.  Successive
+        guides step apart by a fixed number of screen pixels so the second one
+        is not hidden exactly under the first.
+        """
         c = self.mapToScene(self.viewport().rect().center())
+        step = 30.0 / (self.view_scale() or 1.0)
         if horizontal:
-            self.guides_h.append(c.y())
+            self.guides_h.append(c.y() + len(self.guides_h) * step)
         else:
-            self.guides_v.append(c.x())
+            self.guides_v.append(c.x() + len(self.guides_v) * step)
         self.viewport().update()
 
     def clear_guides(self) -> None:
@@ -1176,12 +969,39 @@ class Canvas(QGraphicsView):
         self.guides_v.clear()
         self.viewport().update()
 
+    # ------------------------------------------------------- files from disk
+    # A QGraphicsView switches drops on for its viewport by itself, so it can
+    # hand them to items in the scene.  There are no such items here, so a
+    # folder dropped on the page was accepted and then quietly discarded - and
+    # the middle of the window is exactly where you aim when you drag a folder
+    # in.  Catching them here and passing them up is what makes the whole
+    # window a drop target rather than just the page grid.
+    def dragEnterEvent(self, ev):
+        if ev.mimeData().hasUrls():
+            ev.acceptProposedAction()
+            return
+        super().dragEnterEvent(ev)
+
+    def dragMoveEvent(self, ev):
+        if ev.mimeData().hasUrls():
+            ev.acceptProposedAction()
+            return
+        super().dragMoveEvent(ev)
+
+    def dropEvent(self, ev):
+        if not ev.mimeData().hasUrls():
+            super().dropEvent(ev)
+            return
+        paths = [u.toLocalFile() for u in ev.mimeData().urls() if u.isLocalFile()]
+        ev.acceptProposedAction()
+        if paths:
+            self.filesDropped.emit(paths)
+
     # -------------------------------------------------------------- keyboard
     def keyPressEvent(self, ev):
-        if ev.key() == Qt.Key_Space:
-            self._space = True
-            self.setCursor(Qt.OpenHandCursor)
-            return
+        # Space used to be hold-to-pan.  It is a guide key now, and panning has
+        # two ways left that do not need a modifier at all: middle-drag, and
+        # the wheel, which scrolls rather than zooms.
         step = 10.0 if ev.modifiers() & Qt.ShiftModifier else 1.0
         k = ev.key()
         resize = bool(ev.modifiers() & Qt.AltModifier)
@@ -1215,9 +1035,3 @@ class Canvas(QGraphicsView):
         else:
             super().keyPressEvent(ev)
 
-    def keyReleaseEvent(self, ev):
-        if ev.key() == Qt.Key_Space:
-            self._space = False
-            self.unsetCursor()
-            return
-        super().keyReleaseEvent(ev)

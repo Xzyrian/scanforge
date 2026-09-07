@@ -11,22 +11,61 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import traceback
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 CHECKS = []
+LINES: list[str] = []
+
+
+def log_path() -> str:
+    """Where the report is written.
+
+    A windowed PyInstaller build has no stdout at all - `print` silently goes
+    nowhere - so the one moment the report matters most, running the real .exe,
+    is the moment it would be invisible.  Everything is therefore also written
+    to a file the build script prints afterwards.
+    """
+    override = os.environ.get("SCANFORGE_SELFTEST_LOG")
+    if override:
+        return os.path.abspath(override)
+    return os.path.join(tempfile.gettempdir(), "scanforge-selftest.log")
+
+
+def say(line: str = "") -> None:
+    LINES.append(line)
+    try:
+        print(line)
+    except Exception:                                   # noqa: BLE001
+        pass
+
+
+def _flush_log() -> str:
+    path = log_path()
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8", errors="replace") as fh:
+            fh.write("\n".join(LINES) + "\n")
+    except Exception as exc:                            # noqa: BLE001
+        try:
+            print(f"(could not write {path}: {exc})")
+        except Exception:                               # noqa: BLE001
+            pass
+    return path
 
 
 def check(name: str, fn) -> bool:
     try:
         detail = fn() or ""
     except Exception as exc:                            # noqa: BLE001
-        print(f"  [FAIL] {name}: {exc}")
-        traceback.print_exc()
+        say(f"  [FAIL] {name}: {exc}")
+        for chunk in traceback.format_exc().splitlines():
+            say(f"         {chunk}")
         CHECKS.append(False)
         return False
-    print(f"  [ok]   {name}" + (f"  — {detail}" if detail else ""))
+    say(f"  [ok]   {name}" + (f"  - {detail}" if detail else ""))
     CHECKS.append(True)
     return True
 
@@ -141,7 +180,7 @@ def _detect():
     for y in range(80, 320, 14):
         g[y:y + 5, 60:240] = 30
     angle = autodetect.detect_skew(g)
-    return f"deskew returned {angle:+.3f}°"
+    return f"deskew returned {angle:+.3f} deg"
 
 
 def _qt():
@@ -168,26 +207,34 @@ def _qt():
 
 def selftest() -> int:
     frozen = getattr(sys, "frozen", False)
-    print("=" * 66)
-    print(f"ScanForge self-test  ({'frozen build' if frozen else 'source tree'})")
-    print("=" * 66)
-    print(f"  python {sys.version.split()[0]}   exe: {sys.executable}")
+    say("=" * 66)
+    say(f"ScanForge self-test  ({'frozen build' if frozen else 'source tree'})")
+    say("=" * 66)
+    say(f"  python {sys.version.split()[0]}   exe: {sys.executable}")
 
-    check("numpy", _numpy)
-    check("opencv", _cv2)
-    check("tifffile + imagecodecs", _tifffile)
-    check("pillow", _pillow)
-    check("pdf assembly", _pdf)
-    check("render pipeline", _render)
-    check("joined pages", _join)
-    check("page detection", _detect)
-    check("Qt interface", _qt)
-    check("dialog modules", _dialogs)
+    try:
+        check("numpy", _numpy)
+        check("opencv", _cv2)
+        check("tifffile + imagecodecs", _tifffile)
+        check("pillow", _pillow)
+        check("pdf assembly", _pdf)
+        check("render pipeline", _render)
+        check("joined pages", _join)
+        check("page detection", _detect)
+        check("Qt interface", _qt)
+        check("dialog modules", _dialogs)
+    except BaseException as exc:                        # noqa: BLE001
+        say(f"  [ABORTED] {type(exc).__name__}: {exc}")
+        for chunk in traceback.format_exc().splitlines():
+            say(f"         {chunk}")
+        CHECKS.append(False)
 
-    ok = all(CHECKS)
-    print("-" * 66)
-    print("PASS — this build works" if ok
-          else f"FAIL — {CHECKS.count(False)} of {len(CHECKS)} checks failed")
+    ok = all(CHECKS) and CHECKS
+    say("-" * 66)
+    say("PASS - this build works" if ok
+        else f"FAIL - {CHECKS.count(False)} of {len(CHECKS)} checks failed")
+    say(f"report written to {log_path()}")
+    _flush_log()
     return 0 if ok else 1
 
 

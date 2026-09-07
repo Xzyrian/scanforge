@@ -158,11 +158,13 @@ class ExportDialog(QDialog):
         fe = QFormLayout(g_ex)
         self.chk_zip = QCheckBox("A zip of the exported pages, ready to send")
         self.chk_zip.setToolTip("Named <document>-images.zip. The PDF is not "
-                                "included; the loose files are kept as well.")
+                                "included.")
         self.chk_zip.setChecked(cfg.zip_images)
+        self.chk_zip.toggled.connect(self._sync)
         fe.addRow("", self.chk_zip)
         self.chk_pdf = QCheckBox("A multi-page PDF of the whole set")
         self.chk_pdf.setChecked(cfg.make_pdf)
+        self.chk_pdf.toggled.connect(self._sync)
         fe.addRow("", self.chk_pdf)
         self.sp_pdf_dpi = QDoubleSpinBox()
         self.sp_pdf_dpi.setRange(72, 1200)
@@ -182,6 +184,17 @@ class ExportDialog(QDialog):
         self.sp_workers.setToolTip("Each worker holds a full page in memory; "
                                    "2-3 is the sweet spot for 600 dpi scans")
         fe.addRow("Parallel workers", self.sp_workers)
+
+        self.chk_keep = QCheckBox("Keep the individual page files as well")
+        self.chk_keep.setToolTip(
+            "Off by default. The project file already holds every crop and "
+            "angle against the untouched scans, so the cropped pages are "
+            "usually only a step on the way to the zip or the PDF - and a set "
+            "of 600 dpi TIFFs is several gigabytes to leave lying about.\n"
+            "They are always kept when nothing else is being produced.")
+        self.chk_keep.setChecked(cfg.keep_images)
+        self.chk_keep.toggled.connect(self._sync)
+        fe.addRow("", self.chk_keep)
         root.addWidget(g_ex)
 
         self.lbl_preview = QLabel()
@@ -228,6 +241,12 @@ class ExportDialog(QDialog):
         self.sp_dpi.setEnabled(mode == "Target DPI")
         self.sp_pct.setEnabled(mode == "Percent")
         self.sp_pdf_dpi.setEnabled(self.chk_pdf.isChecked())
+        bundling = self.chk_zip.isChecked() or self.chk_pdf.isChecked()
+        self.chk_keep.setEnabled(bundling)
+        self.chk_keep.setText("Keep the individual page files as well"
+                              if bundling else
+                              "Keep the individual page files (nothing else "
+                              "is being produced)")
         if not self.edits:
             return
         cfg = self.settings()
@@ -249,6 +268,9 @@ class ExportDialog(QDialog):
                         + os.path.basename(pdf_path(cfg))
             if cfg.zip_images:
                 text += "\n    " + _safe_zip_name(cfg) + "-images.zip"
+            if not cfg.keep_images:
+                text = ("(the page files below are written, bundled, then "
+                        "discarded)\n" + text)
             sizes = {e.output_size() for e in self.edits}
             if len(sizes) == 1:
                 w, h = sizes.pop()
@@ -284,6 +306,11 @@ class ExportDialog(QDialog):
         c.pdf_dpi = self.sp_pdf_dpi.value()
         c.also_jpeg_preview = self.chk_preview.isChecked()
         c.workers = self.sp_workers.value()
+        # Discarding the pages only makes sense when something else is being
+        # made out of them; with neither the zip nor the PDF ticked there would
+        # be nothing left at the end of the run.
+        c.keep_images = (self.chk_keep.isChecked()
+                         or not (c.zip_images or c.make_pdf))
         return c
 
     def accept(self) -> None:

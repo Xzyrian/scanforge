@@ -29,6 +29,15 @@ hiddenimports += collect_submodules("imagecodecs")
 binaries += collect_dynamic_libs("imagecodecs")
 hiddenimports += ["tifffile", "PIL.Image", "PIL.ImageFilter", "PIL.ImageCms"]
 
+# The whole app, including the dialogs that are only imported when a menu item
+# is used.  Naming them one at a time meant every new module was a chance to
+# ship a build that dies the first time someone opens the export dialog.
+hiddenimports += collect_submodules("scanforge")
+
+# --selftest lives in tools/, and the build script runs it against the real
+# executable, so it has to be inside the build.
+hiddenimports += ["tools", "tools.freeze_check"]
+
 # Pillow registers its codecs lazily, by importing every *ImagePlugin module on
 # first use.  Frozen, the ones nothing imports directly are simply absent, and
 # saving a PDF then dies with KeyError: 'JPEG' because the PDF writer reaches

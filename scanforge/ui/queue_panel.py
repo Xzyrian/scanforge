@@ -137,6 +137,13 @@ class _PageDelegate(QStyledItemDelegate):
             p.restore()
             return
 
+        # A page the current mode has taken out of play - every page but the
+        # two in an open spread - is drawn faint rather than hidden, so the
+        # document still reads as one run of pages and you can see where in it
+        # you are working.
+        if not (option.state & QStyle.State_Enabled):
+            p.setOpacity(0.32)
+
         selected = bool(option.state & QStyle.State_Selected)
         if selected:
             p.setPen(Qt.NoPen)
@@ -565,6 +572,7 @@ class QueuePanel(QWidget):
     removeRequested = Signal(list)       # [uid]
     orderChanged = Signal(str)           # undo label
     setDocumentRequested = Signal()
+    doneToggleRequested = Signal()
     spreadRequested = Signal()
     joinRequested = Signal()
     unjoinRequested = Signal()
@@ -579,6 +587,8 @@ class QueuePanel(QWidget):
         self._icons: dict = {}           # (path, state) -> QIcon
         self._index: dict = {}           # uid -> position, so labelling is O(1)
         self._items: dict = {}           # uid -> QListWidgetItem
+        # uids the current mode allows; None means the whole document
+        self._restricted_to = None
         self._page_by_uid: dict = {}     # uid -> PageEdit, for the icon filler
 
         self.bridge = ThumbBridge()
@@ -787,6 +797,16 @@ class QueuePanel(QWidget):
         a_unjoin.triggered.connect(self.unjoinRequested.emit)
         a_unjoin.setEnabled(any(p is not None and p.join for p in pages))
         m.addSeparator()
+        # Marking a page done had no inverse anywhere in the queue: Enter set
+        # it, and taking it back meant finding the page again and unticking a
+        # box in the inspector, one page at a time.
+        live = [p for p in pages if p is not None]
+        all_done = bool(live) and all(p.done for p in live)
+        a_done = m.addAction("Mark not done" if all_done else "Mark done")
+        a_done.setShortcut("Ctrl+Return")
+        a_done.triggered.connect(self.doneToggleRequested.emit)
+        a_done.setEnabled(bool(live))
+        m.addSeparator()
         a_up = m.addAction(icons.icon("up", 16), "Move up")
         a_up.triggered.connect(lambda: self._move(-1))
         a_dn = m.addAction(icons.icon("down", 16), "Move down")
@@ -923,6 +943,37 @@ class QueuePanel(QWidget):
         item.setData(_NUM_ROLE, self._index.get(page.uid, 0) + 1)
         item.setData(_MARK_ROLE, self._label(page))
         item.setData(_STATE_ROLE2, (page.is_edited(), page.done))
+        self._apply_restriction(item, page)
+
+    def _apply_restriction(self, item: QListWidgetItem, page: PageEdit) -> None:
+        allowed = self._restricted_to
+        if allowed is None:
+            item.setFlags(item.flags() | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            return
+        on = page.uid in allowed
+        f = item.flags()
+        if on:
+            item.setFlags(f | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        else:
+            item.setFlags(f & ~Qt.ItemIsEnabled & ~Qt.ItemIsSelectable)
+
+    def restrict_to(self, uids) -> None:
+        """Take every page but these out of play.
+
+        The aligner works on two pages; leaving the rest of the queue live let
+        a third page be clicked into the inspector while the aligner went on
+        editing the original pair, so the panel that was open no longer
+        described the pages on screen.
+        """
+        self._restricted_to = set(uids) if uids is not None else None
+        for uid, item in self._items.items():
+            page = self._page_by_uid.get(uid)
+            if page is not None:
+                self._apply_restriction(item, page)
+        self.list.viewport().update()
+
+    def clear_restriction(self) -> None:
+        self.restrict_to(None)
 
     def update_counts(self) -> None:
         total = len(self.project.pages)

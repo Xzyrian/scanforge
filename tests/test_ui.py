@@ -22,9 +22,10 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from PySide6.QtCore import QAbstractAnimation, QPointF, Qt, QEvent
-from PySide6.QtGui import QImage, QKeyEvent, QMouseEvent
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtCore import (QAbstractAnimation, QPoint, QPointF, Qt,
+                            QEvent)
+from PySide6.QtGui import QColor, QImage, QKeyEvent, QMouseEvent
+from PySide6.QtWidgets import QApplication, QStackedWidget, QWidget
 
 from scanforge import proxycache
 from scanforge.export import (ExportSettings, format_name, output_path,
@@ -143,7 +144,10 @@ def main():
                     if not a.isSeparator()]
     check("main bar order",
           main_actions == ["Open scan folder…", "Save project", "Save project as…",
-                           "Export…", "Undo", "Redo", "Show grid"],
+                           "Export…", "Undo", "Redo",
+                           "Add horizontal guide", "Add vertical guide",
+                           "Clear guides", "Show grid",
+                           "Preview as a book…"],
           str(main_actions))
     check("main bar is icons only",
           win.toolbar_main.toolButtonStyle() == Qt.ToolButtonIconOnly)
@@ -279,13 +283,37 @@ def main():
     check("queue rebuilt", win.queue.list.count() == 4, str(win.queue.list.count()))
     check("canvas paints something", nonblank(paint(win.canvas)))
 
-    # -------------------------------------------------- first-crop + loading
-    print("\nfirst crop and loading feedback")
-    check("a fresh project arms the crop tool for you",
-          win.canvas.tool == Tool.CROP, str(win.canvas.tool))
+    # ---------------------------------------------------- the two crop tools
+    print("\ncrop page, crop all pages")
+    check("a fresh project starts on the cursor, not on a tool",
+          win.canvas.tool == Tool.CURSOR, str(win.canvas.tool))
+    check("nothing arms itself and nothing is pre-cropped",
+          all(p.crop is None for p in win.project.pages))
+    check("the project-wide crop toggle is gone",
+          not hasattr(win, "a_link") and not hasattr(win, "toggle_link")
+          and not hasattr(win.project, "link_crop"))
+
     e0 = win._current
     c0 = win.canvas
-    # a click with no drag must not commit a one-pixel crop to the whole project
+
+    def drag_crop(canvas, a, b):
+        canvas.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, QPointF(*a),
+                                           Qt.LeftButton, Qt.LeftButton,
+                                           Qt.NoModifier))
+        for t in (0.35, 0.7, 1.0):
+            canvas.mouseMoveEvent(QMouseEvent(
+                QEvent.MouseMove,
+                QPointF(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t),
+                Qt.NoButton, Qt.LeftButton, Qt.NoModifier))
+        canvas.mouseReleaseEvent(QMouseEvent(QEvent.MouseButtonRelease,
+                                             QPointF(*b), Qt.LeftButton,
+                                             Qt.NoButton, Qt.NoModifier))
+        pump()
+
+    # a click with no drag must not commit a one-pixel crop
+    win.set_tool(Tool.CROP)
+    check("the crop tool arms when asked", win.canvas.tool == Tool.CROP,
+          str(win.canvas.tool))
     c0.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, QPointF(200, 200),
                                    Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
     c0.mouseReleaseEvent(QMouseEvent(QEvent.MouseButtonRelease, QPointF(201, 201),
@@ -294,106 +322,74 @@ def main():
     check("a click without dragging leaves the crop alone",
           all(p.crop is None for p in win.project.pages),
           str([p.crop for p in win.project.pages if p.crop][:1]))
-    check("and the crop tool stays armed for a real attempt",
+    check("and the tool stays armed for a real attempt",
           win.canvas.tool == Tool.CROP, str(win.canvas.tool))
 
-    c0.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, QPointF(80, 80),
-                                   Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
-    for x, y in ((150, 180), (250, 320), (340, 420)):
-        c0.mouseMoveEvent(QMouseEvent(QEvent.MouseMove, QPointF(x, y),
-                                      Qt.NoButton, Qt.LeftButton, Qt.NoModifier))
-    c0.mouseReleaseEvent(QMouseEvent(QEvent.MouseButtonRelease, QPointF(340, 420),
-                                     Qt.LeftButton, Qt.NoButton, Qt.NoModifier))
-    pump()
-    crops = {tuple(round(v) for v in p.crop) for p in win.project.pages if p.crop}
-    check("that first crop reaches every page", len(crops) == 1, str(crops))
+    # "crop page" reaches exactly one page
+    drag_crop(c0, (80, 80), (340, 420))
+    cropped = [p for p in win.project.pages if p.crop]
+    check("crop page crops the page you are on", win._current.crop is not None)
+    check("and no other page", len(cropped) == 1,
+          f"{len(cropped)} pages have a crop")
+    check("the tool releases itself afterwards",
+          win.canvas.tool == Tool.CURSOR, str(win.canvas.tool))
+    kept = tuple(round(v) for v in win._current.crop)
+
+    # "crop all pages" reaches the whole document in one drag
+    win.set_tool(Tool.CROP_ALL)
+    check("the crop-all tool arms", win.canvas.tool == Tool.CROP_ALL,
+          str(win.canvas.tool))
+    drag_crop(c0, (100, 110), (360, 440))
+    crops = {tuple(round(v) for v in p.crop)
+             for p in win.project.pages if p.crop}
+    check("crop all pages gives every page the same crop",
+          len(crops) == 1 and len([p for p in win.project.pages if p.crop])
+          == len(win.project.pages), f"{len(crops)} distinct crops")
     check("and it is a real rectangle, not a stray pixel",
           all(c[2] > 50 and c[3] > 50 for c in crops), str(crops))
-    check("and the tool releases itself afterwards",
-          win.canvas.tool == Tool.CURSOR, str(win.canvas.tool))
-    # The project-wide crop has now done the one job it exists for, so it
-    # releases too - otherwise every later per-page nudge is copied silently
-    # over the whole document, which is how careful work used to vanish.
-    check("the project-wide crop releases itself after that first use",
-          not win.project.link_crop)
-    check("and the tool bar shows it off", not win.a_link.isChecked())
-    check("the status bar explains why",
-          "project-wide crop is now off" in win.statusBar().currentMessage(),
+    check("it is the rectangle just drawn, not the earlier one",
+          crops != {kept}, str(crops))
+    check("it releases itself too", win.canvas.tool == Tool.CURSOR,
+          str(win.canvas.tool))
+    check("and says how far it reached",
+          "pages" in win.statusBar().currentMessage(),
           win.statusBar().currentMessage())
+
+    # nothing propagates unless you asked for it
     win.queue.select(win.project.pages[2].uid)
     wait_until(lambda: win._proxy is not None)
     others = [tuple(p.crop) for p in win.project.pages if p is not win._current]
     win.inspector.spins["x"].setValue(310)
     pump()
-    check("a later crop change now stays on its own page",
+    check("editing a crop afterwards stays on its own page",
           [tuple(p.crop) for p in win.project.pages
-           if p is not win._current] == others,
-          "other pages moved")
+           if p is not win._current] == others, "other pages moved")
 
-    # A bare click or a pan must not count as an edit.  It used to: every mouse
-    # release emitted editChanged, which copied the current page's crop over
-    # every other page - with no undo step, because a click opens none.
-    win.toggle_link(True)
+    # a locked page sits out of crop-all in both directions
+    win.queue.select(win.project.pages[1].uid)
+    wait_until(lambda: win._proxy is not None)
+    win._current.crop_mode = "locked"
+    locked_before = tuple(win._current.crop)
+    win.queue.select(win.project.pages[0].uid)
+    wait_until(lambda: win._proxy is not None)
+    win.set_tool(Tool.CROP_ALL)
+    drag_crop(win.canvas, (90, 100), (330, 400))
+    check("crop all pages leaves a locked page alone",
+          tuple(win.project.pages[1].crop) == locked_before,
+          f"{win.project.pages[1].crop} vs {list(locked_before)}")
+    win.project.pages[1].crop_mode = "linked"
+
+    # a click or a pan is not an edit and must reach nothing
     before_click = [tuple(p.crop) for p in win.project.pages]
-    win.project.pages[0].crop = [11.0, 22.0, 1500.0, 2100.0]
     c0.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, QPointF(300, 300),
                                    Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
     c0.mouseReleaseEvent(QMouseEvent(QEvent.MouseButtonRelease, QPointF(300, 300),
                                      Qt.LeftButton, Qt.NoButton, Qt.NoModifier))
     pump()
-    check("clicking the canvas does not reshape the whole document",
-          [tuple(p.crop) for p in win.project.pages[1:]] == before_click[1:],
+    check("clicking the canvas reshapes nothing",
+          [tuple(p.crop) for p in win.project.pages] == before_click,
           "a click propagated the crop")
-    win.project.pages[0].crop = list(before_click[0])
 
-    # and the release must survive undo: cropping, undoing, cropping again used
-    # to leave the shared crop on for the rest of the session
-    for p in win.project.pages:
-        p.crop = None
-    win.project.link_crop = True
-    win._rearm_first_crop()
-    check("with nothing cropped and the link on, the next crop is the first",
-          win._first_crop_armed)
-    win.queue.select(win.project.pages[0].uid)
-    wait_until(lambda: win._proxy is not None)
-    win.canvas.select_all()
-    pump()
-    check("drawing it releases the link again",
-          not win.project.link_crop)
-
-    # clearing every crop puts the project back to "nothing cropped yet", so
-    # the next crop is the document's crop once more
-    win.toggle_link(True)
-    win.clear_crop()
-    pump()
-    check("clearing the crops re-arms the first-crop release",
-          win._first_crop_armed and win.project.link_crop)
-
-    # a page exempt from the shared crop cannot be the document's first crop:
-    # cropping it propagates nothing, so releasing the link there would leave
-    # every other page uncropped and the link switched off
-    win.queue.select(win.project.pages[1].uid)
-    wait_until(lambda: win._proxy is not None)
-    win._current.crop_mode = "locked"
-    win.canvas.select_all()
-    pump()
-    check("cropping a locked page does not release the shared crop",
-          win.project.link_crop and win._first_crop_armed,
-          f"link={win.project.link_crop} armed={win._first_crop_armed}")
-    win._current.crop_mode = "linked"
-    win._current.crop = None
-
-    win.queue.select(win.project.pages[0].uid)
-    wait_until(lambda: win._proxy is not None)
-    win.canvas.select_all()
-    pump()
-    check("but cropping an ordinary page still does",
-          not win.project.link_crop)
-    win.toggle_link(True)                    # back on for the tests that follow
-    win.queue.select(win.project.pages[1].uid)
-    wait_until(lambda: win._proxy is not None)
-    check("it does not re-arm on later pages",
-          win.canvas.tool == Tool.CURSOR, str(win.canvas.tool))
 
     check("the status bar has a spinner", hasattr(win, "throbber"))
     win._claim("demo", "working")
@@ -567,9 +563,19 @@ def main():
     pump()
     original = list(e.crop)
 
-    # a stray drag in cursor mode must not start a new crop
+    # a stray drag in cursor mode must not start a new crop.  The point has to
+    # be worked out from where the crop actually is rather than guessed at a
+    # fixed corner - the canvas is a different width now that the tools live
+    # beside it, and a hardcoded corner quietly ended up inside the page.
     c = win.canvas
-    press = QMouseEvent(QEvent.MouseButtonPress, QPointF(60, 60), Qt.LeftButton,
+    outside = c.mapFromScene(QPointF(c.crop_scene().left() - 40,
+                                     c.crop_scene().center().y()))
+    check("the probe point really is outside the crop, and on screen",
+          not c.crop_scene().contains(c.mapToScene(outside))
+          and c.viewport().rect().contains(outside),
+          f"{outside.x()},{outside.y()} in {c.viewport().width()}"
+          f"x{c.viewport().height()}")
+    press = QMouseEvent(QEvent.MouseButtonPress, QPointF(outside), Qt.LeftButton,
                         Qt.LeftButton, Qt.NoModifier)
     c.mousePressEvent(press)
     kind = c._drag[0] if c._drag else None
@@ -595,22 +601,62 @@ def main():
     check("toolbar reflects the release", win.a_tool_cursor.isChecked()
           and not win.a_tool_crop.isChecked())
 
-    win.set_tool(Tool.STRAIGHTEN)
+    win.set_tool(Tool.BLUR)
     win.escape()
     check("Esc returns to cursor", win.canvas.tool == Tool.CURSOR)
 
-    check("tool bar order: selection, page, auto, zoom, done",
-          [a.text().replace("&", "") for a in win.toolbar_tools.actions()
-           if not a.isSeparator()] ==
-          ["Cursor", "Crop", "Place alignment guide", "Blur a spot",
-           "Cut into pages",
-           "Same crop for every page", "Copy framing from previous",
-           "Match crop sizes…", "Align as spread…", "Join pages into one…",
-           "Auto straighten  crop", "Auto-deskew page",
-           "Fit crop to page edges", "Fit page", "100%  (actual pixels)",
-           "Preview as a book…", "Mark done and go to next"],
-          str([a.text().replace("&", "") for a in win.toolbar_tools.actions()
-               if not a.isSeparator()]))
+    names = [a.text().replace("&", "") for a in win.toolbar_tools.actions()
+             if not a.isSeparator()]
+    check("the tool column holds the editing tools, in groups",
+          names == ["Cursor", "Crop page", "Crop all pages",
+                    "Blur a spot", "Cut into pages",
+                    "Rotate 90° left", "Rotate 90° right",
+                    "Flip horizontally", "Flip vertically",
+                    "Copy framing from previous",
+                    "Match crop sizes…", "Align as spread…",
+                    "Join pages into one…",
+                    "Auto straighten  crop", "Fit crop to page edges",
+                    "Mark done and go to next"], str(names))
+    check("with a rule between each group",
+          sum(1 for a in win.toolbar_tools.actions() if a.isSeparator()) == 4,
+          str(sum(1 for a in win.toolbar_tools.actions() if a.isSeparator())))
+
+    top = [a.text().replace("&", "") for a in win.toolbar_main.actions()
+           if not a.isSeparator()]
+    check("and the top bar is the document and the view, nothing per-page",
+          top == ["Open scan folder…", "Save project", "Save project as…",
+                  "Export…", "Undo", "Redo",
+                  "Add horizontal guide", "Add vertical guide", "Clear guides",
+                  "Show grid", "Preview as a book…"], str(top))
+
+    # the column sits between the page grid and the canvas, which is the whole
+    # point of it - the tools are next to the thing they act on
+    shell = [win.work_layout.itemAt(i).widget()
+             for i in range(win.work_layout.count())]
+    check("the tool column is the leftmost thing in the window",
+          shell[0] is win.tool_column and shell[1] is win.splitter,
+          str([type(w).__name__ for w in shell]))
+    order = [win.splitter.widget(i) for i in range(win.splitter.count())]
+    check("then the editing area, then the pages",
+          order == [win.editing, win.right_col],
+          str([type(w).__name__ for w in order]))
+    check("the page grid is the top of the right-hand column",
+          win.right_col.widget(0) is win.queue,
+          str([type(win.right_col.widget(i)).__name__
+               for i in range(win.right_col.count())]))
+    check("with what is left of the panel below it, for now",
+          win.inspector in win.right_col.widget(1).findChildren(type(win.inspector))
+          or win.right_col.widget(1) is win.inspector_scroll)
+    check("and the panel scrolls rather than pushing the grid out",
+          win.queue.height() >= 340
+          and win.queue.list.viewport().height() > 152,
+          f"grid {win.queue.height()} px, viewport "
+          f"{win.queue.list.viewport().height()} px")
+    check("the canvas and its angle strip are the editing area",
+          win.center.parent() is win.editing
+          and win.angle_strip.parent() is win.editing)
+    check("and nothing sits to the right of the pages",
+          win.splitter.count() == 2, str(win.splitter.count()))
 
     # --------------------------------------------------------- orientation
     print("\norientation")
@@ -794,64 +840,57 @@ def main():
           not any(p.done for p in win.project.pages),
           str([p.done for p in win.project.pages]))
 
-    # --------------------------------------------------------- linked crop
-    print("\nlinked crop")
-    # it was switched back on by hand after the first crop released it, which
-    # is exactly the journey a real project takes
-    win.toggle_link(True)
-    check("linking can be switched back on", win.project.link_crop)
-    win.queue.select(win.project.pages[0].uid)
-    wait_until(lambda: win._proxy is not None)
-    win.inspector.spins["w"].setValue(1800)
-    win.inspector.spins["h"].setValue(2600)
-    pump()
-    sizes = {p.output_size() for p in win.project.pages}
-    check("every page took the new crop size", sizes == {(1800, 2600)}, str(sizes))
-    check("queue reports one uniform size",
-          win.project.uniform_size() == (1800, 2600), str(win.project.uniform_size()))
-
-    win.queue.select(win.project.pages[2].uid)
-    wait_until(lambda: win._proxy is not None)
-    win.inspector.spins["x"].setValue(120)
-    pump()
-    xs = {round(p.crop[0]) for p in win.project.pages}
-    check("position propagates too", xs == {120}, str(xs))
+    # --------------------------------------------------- what crop-all reaches
+    print("\ncrop all pages, and the modes that opt out")
+    for p_ in win.project.pages:
+        p_.crop_mode = "linked"
+        p_.crop = [10.0, 20.0, 1000.0, 1400.0]
+    src = win.project.pages[0]
+    src.crop = [50.0, 60.0, 1800.0, 2600.0]
 
     win.project.pages[1].crop_mode = "own_position"
-    win.project.pages[1].crop = [999.0, 888.0, 1800.0, 2600.0]
-    win.queue.select(win.project.pages[0].uid)
-    wait_until(lambda: win._proxy is not None)
-    win.inspector.spins["x"].setValue(200)
-    pump()
-    p1 = win.project.pages[1]
-    check("an independent page keeps its own position", round(p1.crop[0]) == 999,
-          str(p1.crop[0]))
-    check("but is forced to the shared size", p1.output_size() == (1800, 2600),
-          str(p1.output_size()))
-
+    win.project.pages[1].crop = [999.0, 888.0, 1200.0, 1500.0]
     locked = win.project.pages[3]
     locked.crop_mode = "locked"
     locked.crop = [7.0, 8.0, 1234.0, 5678.0]
-    keep = list(locked.crop)
-    win.queue.select(win.project.pages[0].uid)
-    wait_until(lambda: win._proxy is not None)
-    win.inspector.spins["x"].setValue(321)
-    pump()
-    check("a locked page resists the shared crop", locked.crop == keep,
-          str(locked.crop))
-    locked.crop_mode = "linked"
-    locked.crop = list(win.project.pages[0].crop)     # back in step with the rest
+    keep_locked = list(locked.crop)
 
-    win.toggle_link(False)
-    check("link can be turned off", not win.project.link_crop)
-    win.toggle_link(True)
+    n = win.project.apply_crop_to_all(src)
+    check("crop-all reaches every page it is allowed to", n == 2, str(n))
+    check("an ordinary page takes the whole rectangle",
+          [round(v) for v in win.project.pages[2].crop] == [50, 60, 1800, 2600],
+          str(win.project.pages[2].crop))
+    p1 = win.project.pages[1]
+    check("an own-position page keeps where it sits",
+          round(p1.crop[0]) == 999 and round(p1.crop[1]) == 888,
+          str(p1.crop[:2]))
+    check("but still takes the size, so the pages match",
+          p1.output_size() == (1800, 2600), str(p1.output_size()))
+    check("a locked page is not touched at all",
+          list(locked.crop) == keep_locked, str(locked.crop))
+    check("and a locked page cannot push its crop onto anyone",
+          win.project.apply_crop_to_all(locked) == 0)
+
+    # editing one page afterwards must not follow the others around
+    win.queue.select(win.project.pages[2].uid)
+    wait_until(lambda: win._proxy is not None)
+    others = [tuple(p_.crop) for p_ in win.project.pages if p_ is not win._current]
+    win.inspector.spins["x"].setValue(310)
+    pump()
+    check("a later edit stays on the page it was made on",
+          [tuple(p_.crop) for p_ in win.project.pages
+           if p_ is not win._current] == others, "other pages moved")
+
+    locked.crop_mode = "linked"
+    win.project.pages[1].crop_mode = "linked"
+    win.project.apply_crop_to_all(src)
 
     # ------------------------------------------------------------ undo/redo
     print("\nundo / redo")
     win.queue.select(win.project.pages[0].uid)
     wait_until(lambda: win._proxy is not None)
     before_angle = win._current.angle
-    win.inspector.spin_angle.setValue(-1.25)
+    win.angle_strip.spin.setValue(-1.25)
     pump()
     win._end_history()
     check("angle changed", abs(win._current.angle - (-1.25)) < 1e-9)
@@ -1156,13 +1195,15 @@ def main():
     check("it never collapses below one column",
           q.snapped_width(4) == q.width_for_columns(1),
           str(q.snapped_width(4)))
+    # the grid is the right-hand pane now, so the divider that sizes it is the
+    # one between the editing area and the column
     sizes = win.splitter.sizes()
-    win.splitter.setSizes([q.width_for_columns(2) + 17, sizes[1] - 17, sizes[2]])
+    win.splitter.setSizes([sizes[0] - 17, q.width_for_columns(2) + 17])
     win._snap_queue_width()
     pump()
     check("dragging the divider lands it on a column boundary",
-          win.splitter.sizes()[0] == q.width_for_columns(2),
-          f"{win.splitter.sizes()[0]} vs {q.width_for_columns(2)}")
+          win.splitter.sizes()[1] == q.width_for_columns(2),
+          f"{win.splitter.sizes()[1]} vs {q.width_for_columns(2)}")
 
     # ------------------------------------------------- move to position x of n
     print("\nmove to position")
@@ -1263,6 +1304,27 @@ def main():
           "Sony_KV-16G1.pdf" in dlg2.lbl_preview.text())
     check("dialog confirms one uniform size",
           "Every page" in dlg2.lbl_preview.text())
+
+    # the page files can be a means to an end: off by default, and forced
+    # back on when nothing else is being produced from them
+    check("the export omits the loose page files by default",
+          not dlg2.chk_keep.isChecked() and dlg2.chk_keep.isEnabled())
+    dlg2.chk_zip.setChecked(True)
+    dlg2.chk_pdf.setChecked(False)
+    dlg2.chk_keep.setChecked(False)
+    check("so a zip-only run does not keep them",
+          not dlg2.settings().keep_images)
+    check("and the preview says the pages will be discarded",
+          "discarded" in dlg2.lbl_preview.text(), dlg2.lbl_preview.text()[:60])
+    dlg2.chk_zip.setChecked(False)
+    dlg2.chk_pdf.setChecked(False)
+    pump()
+    check("with neither a zip nor a PDF the pages are kept regardless",
+          dlg2.settings().keep_images)
+    check("and the choice is greyed out with a reason",
+          not dlg2.chk_keep.isEnabled()
+          and "nothing else" in dlg2.chk_keep.text(), dlg2.chk_keep.text())
+    dlg2.chk_zip.setChecked(True)
     dlg2.close()
 
     # ---------------------------------------------------------------- spread
@@ -1303,6 +1365,117 @@ def main():
         check("spread view paints both pages", nonblank(paint(v)))
         v.add_guide(True)
         check("spread view paints with guides", nonblank(paint(v)))
+
+        # the rest of the document is out of play while two pages are open
+        flags = {i: bool(win.queue._items[p.uid].flags() & Qt.ItemIsEnabled)
+                 for i, p in enumerate(win.project.pages)}
+        pair = {win.project.index_of(dlg.left.uid),
+                win.project.index_of(dlg.right.uid)}
+        check("only the two pages being aligned stay selectable",
+              {i for i, on in flags.items() if on} == pair,
+              f"enabled {sorted(i for i, on in flags.items() if on)}, "
+              f"aligning {sorted(pair)}")
+        check("and the inspector cannot be used on a page that is not on screen",
+              not win.inspector.isEnabled())
+        check("the page grid keeps its columns in spread mode",
+              win.queue.columns_for_width(win.queue.width()) >= 2,
+              f"{win.queue.columns_for_width(win.queue.width())} columns at "
+              f"{win.queue.width()} px")
+
+        # a guide belongs in the middle of the window, not the middle of the
+        # spread - they are only the same thing when the view is fitted
+        v.clear_guides()
+
+        # linked crop sizes: a bound spread has to come out as two pages of
+        # the same shape, whatever the scanner did with each half
+        keep_l_start = list(dlg.left.crop)
+        keep_r_start = list(dlg.right.crop)
+        dlg.left.crop = [10.0, 20.0, 1000.0, 1400.0]
+        dlg.right.crop = [30.0, 40.0, 900.0, 1300.0]
+        v.active = "left"
+        check("the two halves start at different sizes",
+              dlg.left.output_size() != dlg.right.output_size(),
+              f"{dlg.left.output_size()} vs {dlg.right.output_size()}")
+        pane_link = getattr(dlg, "chk_link_size", None)
+        check("the aligner offers a size link", pane_link is not None)
+
+        pane_link.setChecked(True)
+        pump()
+        check("switching it on matches them there and then",
+              dlg.left.output_size() == dlg.right.output_size(),
+              f"{dlg.left.output_size()} vs {dlg.right.output_size()}")
+        check("and it took the size from the active page, leaving the other "
+              "page where it sits",
+              dlg.right.crop[0] == 30.0 and dlg.right.crop[1] == 40.0,
+              str(dlg.right.crop[:2]))
+
+        # drag a crop frame by a handle: the other page follows in size only
+        v.active = "right"
+        r = v.crop_spread("right")
+        grab = QPointF(r.center().x(), r.bottom())
+        side, handle, idx = v._hit_handle(grab)
+        check("a crop frame can be grabbed by its handles",
+              side == "right" and handle == "b", f"{side} {handle}")
+        before_pos = list(dlg.left.crop[:2])
+        scr = v._to_screen(grab)
+        v.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, scr,
+                                      Qt.LeftButton, Qt.LeftButton,
+                                      Qt.NoModifier))
+        end = QPointF(scr.x(), scr.y() - 60)
+        v.mouseMoveEvent(QMouseEvent(QEvent.MouseMove, end, Qt.NoButton,
+                                     Qt.LeftButton, Qt.NoModifier))
+        v.mouseReleaseEvent(QMouseEvent(QEvent.MouseButtonRelease, end,
+                                        Qt.LeftButton, Qt.NoButton,
+                                        Qt.NoModifier))
+        pump()
+        check("resizing one page resizes the other with it",
+              dlg.left.output_size() == dlg.right.output_size(),
+              f"{dlg.left.output_size()} vs {dlg.right.output_size()}")
+        check("the drag actually made the pages shorter",
+              dlg.right.crop[3] < 1400.0, str(dlg.right.crop[3]))
+        check("and the linked page did not move, only change shape",
+              list(dlg.left.crop[:2]) == before_pos,
+              f"{dlg.left.crop[:2]} vs {before_pos}")
+
+        # with the link off the two are independent again
+        pane_link.setChecked(False)
+        pump()
+        v.active = "left"
+        lr2 = v.crop_spread("left")
+        grab = QPointF(lr2.right(), lr2.center().y())
+        scr = v._to_screen(grab)
+        keep_right = dlg.right.output_size()
+        v.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, scr,
+                                      Qt.LeftButton, Qt.LeftButton,
+                                      Qt.NoModifier))
+        end = QPointF(scr.x() - 40, scr.y())
+        v.mouseMoveEvent(QMouseEvent(QEvent.MouseMove, end, Qt.NoButton,
+                                     Qt.LeftButton, Qt.NoModifier))
+        v.mouseReleaseEvent(QMouseEvent(QEvent.MouseButtonRelease, end,
+                                        Qt.LeftButton, Qt.NoButton,
+                                        Qt.NoModifier))
+        pump()
+        check("unlinked, one page resizes on its own",
+              dlg.left.output_size() != dlg.right.output_size()
+              and dlg.right.output_size() == keep_right,
+              f"{dlg.left.output_size()} vs {dlg.right.output_size()}")
+
+        # a crop cannot be dragged away to nothing
+        v.active = "left"
+        lr3 = v.crop_spread("left")
+        v._resize_crop("left", "r", list(dlg.left.crop), -1e6, 0.0)
+        check("a page cannot be shrunk to nothing", dlg.left.crop[2] >= 40.0,
+              str(dlg.left.crop[2]))
+
+        dlg.left.crop = list(keep_l_start)
+        dlg.right.crop = list(keep_r_start)
+        v.active = "left"
+        v.add_guide(True)
+        mid = v._to_spread(QPointF(v.width() / 2.0, v.height() / 2.0))
+        check("a spread guide lands on the middle of the viewport",
+              abs(v.guides[0] - mid.y()) < 1.0,
+              f"{v.guides[0]:.0f} vs {mid.y():.0f}")
+        v.clear_guides()
         v.match_size("both")
         check("match size equalises output",
               dlg.left.output_size() == dlg.right.output_size(),
@@ -1318,7 +1491,7 @@ def main():
         other_page = next(p for p in win.project.pages
                           if p.uid not in (dlg.left.uid, dlg.right.uid))
         other_page.crop = [1.0, 2.0, 900.0, 900.0]
-        win.project.apply_linked_crop(other_page)
+        win.project.apply_crop_to_all(other_page)
         check("and the shared crop no longer destroys the alignment",
               dlg.left.crop == keep_l and dlg.right.crop == keep_r,
               f"{dlg.left.crop} / {dlg.right.crop}")
@@ -1326,88 +1499,456 @@ def main():
         check("finishing puts the canvas back",
               win._mode is None and win.center.currentWidget() is win.canvas)
 
-    # -------------------------------------------------- alignment guide
-    print("\nalignment guide")
+    # ------------------------------------------------- the first crop
+    print("\ncropping from the sheet edge")
+    # this section deliberately empties the crops, so put back exactly what
+    # every other section left behind rather than a plausible-looking blank
+    saved_state = [(p_.uid, list(p_.crop) if p_.crop else None, p_.crop_mode)
+                   for p_ in win.project.pages]
+    saved_link = None
     win.queue.select(win.project.pages[0].uid)
     wait_until(lambda: win._proxy is not None)
     win.canvas.fit()
     pump()
     c = win.canvas
-    win.set_tool(Tool.ALIGN)
-    check("the guide tool arms", c.tool == Tool.ALIGN, str(c.tool))
-    c.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, QPointF(120, 300),
-                                  Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
-    for x in (200, 320, 420):
-        c.mouseMoveEvent(QMouseEvent(QEvent.MouseMove, QPointF(x, 303),
-                                     Qt.NoButton, Qt.LeftButton, Qt.NoModifier))
-    angle_before = win._current.angle
-    c.mouseReleaseEvent(QMouseEvent(QEvent.MouseButtonRelease, QPointF(420, 303),
-                                    Qt.LeftButton, Qt.NoButton, Qt.NoModifier))
+    page = win._current
+    win.clear_crop()
     pump()
-    check("the guide stays on the canvas after the drag",
-          c.align_line is not None)
-    check("drawing it does NOT rotate the page — you turn the page onto it",
-          win._current.angle == angle_before,
-          f"{angle_before} -> {win._current.angle}")
-    check("a nearly-level guide snaps to the axis", c.align_axis == "h",
-          f"axis={c.align_axis!r} angle={c.guide_angle():.4f}")
-    a, b = c.guide_points()
-    check("...and is therefore exactly level", abs(a.y() - b.y()) < 1e-9,
-          f"{a.y():.4f} vs {b.y():.4f}")
-    check("the guide tool releases like the others", c.tool == Tool.CURSOR)
-    check("canvas paints with the guide on it", nonblank(paint(c)))
+    check("a fresh page has no crop of its own", page.crop is None,
+          str(page.crop))
+    full = c.crop_scene()
+    check("but it shows one: the whole sheet",
+          full.width() > 1 and full.height() > 1,
+          f"{full.width():.0f}x{full.height():.0f}")
 
-    # The guide belongs to the editor window, not to the page: it is a
-    # straightedge held against the screen, so rotating, panning or zooming
-    # moves the page underneath while the guide stays exactly where it was put.
-    where_before = c.align_line
-    angle_before = c.guide_angle()
-    win._set_angle(win._current.angle + 0.4)
-    pump()
-    check("rotating the page does not move the guide",
-          c.align_line == where_before, str(c.align_line))
-    check("the guide keeps its own angle while the page turns",
-          abs(c.guide_angle() - angle_before) < 1e-9,
-          f"{angle_before:.5f} -> {c.guide_angle():.5f}")
-    c.zoom_by(1.7)
-    c.horizontalScrollBar().setValue(c.horizontalScrollBar().value() + 60)
-    pump()
-    check("zooming and panning do not move it either",
-          c.align_line == where_before and abs(c.guide_angle()) < 1e-9,
-          str(c.align_line))
-    win.canvas.fit()
-    pump()
+    edge = QPointF(full.left(), full.center().y())
+    kind, _d = c._hit(edge)
+    check("the sheet's edge can be grabbed", kind == "l", str(kind))
+    check("but the middle of it cannot be dragged around",
+          c._hit(full.center())[0] is None, str(c._hit(full.center())[0]))
 
-    # dragging it by the middle moves the whole line
-    at = c.guide_view_points()
-    scr = QPointF((at[0].x() + at[1].x()) / 2.0,
-                  (at[0].y() + at[1].y()) / 2.0)
-    c.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, QPointF(scr),
+    # drag that edge in: the crop window that was already there is what gets
+    # edited, rather than a new rectangle being drawn from nothing
+    win.set_tool(Tool.CURSOR)
+    start = c.mapFromScene(edge)
+    c.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, QPointF(start),
                                   Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
-    grabbed = c._drag[0] if c._drag else None
     c.mouseMoveEvent(QMouseEvent(QEvent.MouseMove,
-                                 QPointF(scr.x(), scr.y() + 40),
+                                 QPointF(start.x() + 60, start.y()),
                                  Qt.NoButton, Qt.LeftButton, Qt.NoModifier))
     c.mouseReleaseEvent(QMouseEvent(QEvent.MouseButtonRelease,
-                                    QPointF(scr.x(), scr.y() + 40),
+                                    QPointF(start.x() + 60, start.y()),
                                     Qt.LeftButton, Qt.NoButton, Qt.NoModifier))
-    check("the guide can be picked up and moved", grabbed == "guide_move",
-          str(grabbed))
-    check("moving it does not rotate anything either",
-          abs(c.guide_angle()) < 1e-6, f"{c.guide_angle():.5f}")
+    pump()
+    check("dragging the edge crops the page", page.crop is not None,
+          str(page.crop))
+    if page.crop:
+        check("it took the sheet in from the left, keeping the rest",
+              page.crop[0] > 1 and page.crop[3] > full.height() * 0.5,
+              f"x={page.crop[0]:.0f} h={page.crop[3]:.0f}")
+    check("and it stayed on that page, as crop-page always does",
+          sum(1 for p_ in win.project.pages if p_.crop) >= 1)
 
-    # a deliberately crooked guide, and the one-press way to meet it
-    vw, vh = c.viewport().width(), c.viewport().height()
-    c.set_guide_points(QPointF(vw * 0.2, vh * 0.5),
-                       QPointF(vw * 0.8, vh * 0.5 + vw * 0.6 * 0.01), "")
-    before = win._current.angle
-    delta = c.rotate_page_to_guide()
-    check("rotate-to-guide turns the page by the guide's own slope",
-          abs(delta) > 1e-3
-          and abs(win._current.angle - (before + delta)) < 2e-3,
-          f"{delta:+.3f}° — page went {before:+.3f}° to {win._current.angle:+.3f}°")
-    c.clear_guide()
-    check("the guide can be cleared", c.align_line is None)
+    for uid, crop, mode in saved_state:
+        p_ = win.project.by_uid(uid)
+        if p_ is not None:
+            p_.crop = list(crop) if crop else None
+            p_.crop_mode = mode
+    win.queue.rebuild()
+    pump()
+    check("the section put the project back as it found it",
+          [(p_.uid, list(p_.crop) if p_.crop else None, p_.crop_mode)
+           for p_ in win.project.pages] == saved_state
+)
+
+    # ------------------------------------------------------- the angle strip
+    print("\nthe angle strip")
+    win.queue.select(win.project.pages[0].uid)
+    wait_until(lambda: win._proxy is not None)
+    pump()
+    st = win.angle_strip
+    check("straightening left the side panel",
+          not hasattr(win.inspector, "spin_angle")
+          and not hasattr(win.inspector, "btn_ccw"))
+    check("the strip has the three controls and nothing else",
+          hasattr(st, "spin") and hasattr(st, "slider") and hasattr(st, "btn_zero"))
+
+    st.spin.setValue(0.75)
+    pump()
+    check("typing an angle turns the page",
+          abs(win._current.angle - 0.75) < 1e-6, f"{win._current.angle:+.3f}")
+    check("and the slider went with it", st.slider.value() == 750,
+          str(st.slider.value()))
+    st.slider.setValue(-1200)
+    pump()
+    check("dragging the slider turns it too",
+          abs(win._current.angle + 1.2) < 1e-6, f"{win._current.angle:+.3f}")
+    check("and the box went with it", abs(st.spin.value() + 1.2) < 1e-6,
+          str(st.spin.value()))
+    st.btn_zero.click()
+    pump()
+    check("and zero puts it back square", abs(win._current.angle) < 1e-9,
+          f"{win._current.angle:+.3f}")
+
+    # an angle set from anywhere else has to reach the strip
+    win.canvas.set_angle(0.33)
+    win.angle_strip.refresh()
+    pump()
+    check("an angle set elsewhere shows in the strip",
+          abs(st.spin.value() - 0.33) < 1e-6, str(st.spin.value()))
+    win.canvas.set_angle(0.0)
+    win.angle_strip.refresh()
+    pump()
+
+    # ------------------------------------------------------ orientation tools
+    print("\norientation in the column")
+    for a in (win.a_rot_ccw, win.a_rot_cw, win.a_flip_h, win.a_flip_v):
+        check(f"{a.text().replace('&', '')} is in the tool column",
+              a in win.tool_column.actions())
+    q0 = win._current.quadrant
+    win.a_rot_cw.trigger()
+    pump()
+    check("rotate right turns the page a quarter",
+          win._current.quadrant == (q0 + 1) % 4, str(win._current.quadrant))
+    win.a_rot_ccw.trigger()
+    pump()
+    check("and rotate left turns it back", win._current.quadrant == q0,
+          str(win._current.quadrant))
+    f0 = win._current.flip_h
+    win.a_flip_h.trigger()
+    pump()
+    check("flip horizontally mirrors the page", win._current.flip_h != f0)
+    win.a_flip_h.trigger()
+    pump()
+    check("and flipping again puts it back", win._current.flip_h == f0)
+
+    # ---------------------------------------------------------- guides
+    print("\nguides")
+    win.queue.select(win.project.pages[0].uid)
+    wait_until(lambda: win._proxy is not None)
+    win.canvas.fit()
+    pump()
+    c = win.canvas
+    c.clear_guides()
+    check("the straightedge is gone for good",
+          not hasattr(c, "align_line") and not hasattr(Tool, "ALIGN"))
+    check("guides are on Space and Shift+Space",
+          win.a_guide_h.shortcut().toString() == "Space"
+          and win.a_guide_v.shortcut().toString() == "Shift+Space",
+          f"{win.a_guide_h.shortcut().toString()!r} / "
+          f"{win.a_guide_v.shortcut().toString()!r}")
+    check("and they have their own segment in the top bar",
+          all(a in win.toolbar_main.actions()
+              for a in (win.a_guide_h, win.a_guide_v, win.a_guide_clear)))
+    check("Space no longer holds the canvas in pan mode",
+          not hasattr(c, "_space"))
+
+    # a guide lands in the middle of what you are looking at, not the middle
+    # of the page - the two are different as soon as you zoom in
+    c.fit()
+    pump()
+    win._add_guide(True)
+    win._add_guide(False)
+    centre = c.mapToScene(c.viewport().rect().center())
+    check("a horizontal guide lands on the view's centre line",
+          abs(c.guides_h[0] - centre.y()) < 1.5,
+          f"{c.guides_h[0]:.0f} vs {centre.y():.0f}")
+    check("and a vertical one likewise",
+          abs(c.guides_v[0] - centre.x()) < 1.5,
+          f"{c.guides_v[0]:.0f} vs {centre.x():.0f}")
+
+    c.clear_guides()
+    c.zoom_to(2.5) if hasattr(c, "zoom_to") else c.scale(3.0, 3.0)
+    c.centerOn(centre.x() + 400, centre.y() + 600)
+    pump()
+    win._add_guide(True)
+    moved = c.mapToScene(c.viewport().rect().center())
+    check("zoomed in, the guide follows the view rather than the page",
+          abs(c.guides_h[0] - moved.y()) < 2.0,
+          f"guide {c.guides_h[0]:.0f}, view centre {moved.y():.0f}, "
+          f"page centre {centre.y():.0f}")
+
+    win._add_guide(True)
+    check("a second guide does not hide under the first",
+          abs(c.guides_h[1] - c.guides_h[0]) > 1e-6,
+          f"{c.guides_h[0]:.1f} vs {c.guides_h[1]:.1f}")
+
+    win._clear_guides()
+    check("clear takes them all off", not c.guides_h and not c.guides_v)
+
+    c.fit()
+    pump()
+
+    # --------------------------------------------------------- dropping files
+    print("\ndropping a folder anywhere")
+    from PySide6.QtCore import QMimeData, QUrl
+    from PySide6.QtGui import QDropEvent
+
+    def drop_on(widget, paths, pos=None):
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(p) for p in paths])
+        pt = QPointF(pos or widget.rect().center())
+        ev = QDropEvent(pt, Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
+        widget.dropEvent(ev)
+        pump()
+        return ev.isAccepted()
+
+    seen = []
+    real_take = win.take_dropped_paths
+    win.take_dropped_paths = lambda ps: seen.append(list(ps))
+    win.canvas.filesDropped.disconnect()
+    win.canvas.filesDropped.connect(win.take_dropped_paths)
+
+    check("the canvas accepts drops at all", win.canvas.acceptDrops())
+    accepted = drop_on(win.canvas, ["/tmp/dropped_folder"])
+    check("dropping on the page reaches the window",
+          accepted and seen == [["/tmp/dropped_folder"]], str(seen))
+
+    seen.clear()
+    drop_on(win, ["/tmp/another"])
+    check("and so does dropping on the window chrome",
+          seen == [["/tmp/another"]], str(seen))
+
+    seen.clear()
+    drop_on(win.queue.list, ["/tmp/third"])
+    check("the page grid still takes them, by the same route",
+          seen == [["/tmp/third"]], str(seen))
+
+    win.canvas.filesDropped.disconnect()
+    win.take_dropped_paths = real_take
+    win.canvas.filesDropped.connect(win.take_dropped_paths)
+
+    # a project file opens rather than being added as if it were a scan
+    proj_path = os.path.join(TMP, "dropped.sfproj")
+    win.project.save(proj_path)
+    opened = []
+    real_open = win._open_project_file
+    win._open_project_file = lambda p_: opened.append(p_)
+    win.take_dropped_paths([proj_path, "/tmp/a_scan.tif"])
+    check("a dropped project opens instead of being imported",
+          opened == [proj_path], str(opened))
+    win._open_project_file = real_open
+
+    # ------------------------------------------------------------- zooming
+    print("\nzooming")
+    c = win.canvas
+    win.queue.select(win.project.pages[0].uid)
+    wait_until(lambda: win._proxy is not None)
+    c.fit()
+    pump()
+
+    check("100% and 50% are gone", not hasattr(win, "a_100")
+          and not hasattr(win, "a_50"))
+
+    # zoom means nothing with no page open, and a transform applied to an empty
+    # scene used to stick: the first page then arrived at that magnification
+    keep_page, keep_proxy = win._current, win._proxy
+    win.canvas.set_page(None, None)
+    pump()
+    check("with no page, the zoom controls are switched off",
+          not win.zoom_slider.isEnabled() and not win.btn_fit.isEnabled()
+          and not win.a_fit.isEnabled() and not win.a_zoomin.isEnabled())
+    check("and the readout says so, rather than a number",
+          "%" not in win.lbl_zoom.text(), win.lbl_zoom.text())
+    before = win.canvas.transform().m11()
+    win.canvas.zoom_by(3.0)
+    win.canvas.zoom_to(1.0)
+    win.canvas.fit()
+    check("and zooming an empty canvas does nothing at all",
+          abs(win.canvas.transform().m11() - before) < 1e-9,
+          f"{before} -> {win.canvas.transform().m11()}")
+    win.canvas.set_page(keep_page, keep_proxy)
+    pump()
+    check("with a page open they come back",
+          win.zoom_slider.isEnabled() and win.a_fit.isEnabled())
+    check("and so is show thirds", not hasattr(win, "a_thirds")
+          and not hasattr(c, "show_thirds"))
+
+    # the slider is the zoom control, and it runs both ways
+    fitted = c.zoom_percent()
+    check("the status bar reports the fitted zoom", 1 < fitted < 100,
+          f"{fitted:.1f}%")
+    check("the slider followed the canvas",
+          abs(win.zoom_slider.value() - win._zoom_to_slider(fitted)) <= 1,
+          f"{win.zoom_slider.value()} vs {win._zoom_to_slider(fitted)}")
+    check("and the readout agrees", "%" in win.lbl_zoom.text(),
+          win.lbl_zoom.text())
+
+    win.zoom_slider.setValue(win._zoom_to_slider(fitted * 3))
+    pump()
+    check("dragging the slider zooms the canvas",
+          abs(c.zoom_percent() - fitted * 3) < fitted * 0.15,
+          f"{c.zoom_percent():.1f}% wanted {fitted * 3:.1f}%")
+
+    c.fit()
+    pump()
+    check("and Fit puts the slider back",
+          abs(win.zoom_slider.value() - win._zoom_to_slider(c.zoom_percent())) <= 1,
+          str(win.zoom_slider.value()))
+    check("the fit button in the status bar is the Fit action",
+          win.btn_fit.defaultAction() is win.a_fit)
+
+    # the slider is logarithmic, so the low end is not all crammed together
+    lo = win._slider_to_zoom(0)
+    mid = win._slider_to_zoom(win.ZOOM_STEPS // 2)
+    hi = win._slider_to_zoom(win.ZOOM_STEPS)
+    check("the slider is logarithmic, not linear",
+          abs(mid - (lo * hi) ** 0.5) < 0.5,
+          f"{lo:.1f}% · {mid:.1f}% · {hi:.0f}%")
+
+    # the wheel: bare scrolls, shift scrolls across, ctrl zooms
+    from PySide6.QtGui import QWheelEvent
+    def wheel(mods, dy=120):
+        pos = QPointF(c.viewport().rect().center())
+        ev = QWheelEvent(pos, c.viewport().mapToGlobal(pos.toPoint()),
+                         QPoint(0, 0), QPoint(0, dy), Qt.NoButton, mods,
+                         Qt.NoScrollPhase, False)
+        c.wheelEvent(ev)
+        pump()
+
+    c.fit()
+    pump()
+    c.zoom_by(4.0)          # zoom in so there is somewhere to scroll to
+    pump()
+    vbar, hbar = c.verticalScrollBar(), c.horizontalScrollBar()
+    v0, h0, z0 = vbar.value(), hbar.value(), c.zoom_percent()
+    wheel(Qt.NoModifier)
+    check("a bare wheel scrolls down the page, it does not zoom",
+          vbar.value() != v0 and abs(c.zoom_percent() - z0) < 1e-6,
+          f"scroll {v0} -> {vbar.value()}, zoom {z0:.1f}%")
+
+    v1, h1 = vbar.value(), hbar.value()
+    wheel(Qt.ShiftModifier)
+    check("Shift+wheel scrolls across instead",
+          hbar.value() != h1 and vbar.value() == v1,
+          f"h {h1} -> {hbar.value()}, v {v1} -> {vbar.value()}")
+
+    z1 = c.zoom_percent()
+    wheel(Qt.ControlModifier)
+    check("Ctrl+wheel is what zooms", c.zoom_percent() > z1,
+          f"{z1:.1f}% -> {c.zoom_percent():.1f}%")
+
+    keys = [k.toString() for k in win.a_zoomin.shortcuts()]
+    check("zoom in is bound to both the keycap and what the key sends",
+          "Ctrl++" in keys and "Ctrl+=" in keys, str(keys))
+    check("and the menu shows the keycap", keys[0] == "Ctrl++", str(keys))
+    check("zoom out likewise",
+          [k.toString() for k in win.a_zoomout.shortcuts()] == ["Ctrl+-"],
+          str([k.toString() for k in win.a_zoomout.shortcuts()]))
+    c.fit()
+    pump()
+
+    # ------------------------------------------------------ grid and chrome
+    print("\ngrid and chrome")
+    c = win.canvas
+    c.clear_guides()
+    win.toggle_grid(False)
+    pump()
+    plain = paint(c)
+    win.toggle_grid(True)
+    pump()
+    gridded = paint(c)
+
+    def differing(a, b):
+        """Total ink laid down, not merely how many pixels moved.
+
+        Counting changed pixels barely separates a hairline from a two-pixel
+        line - it is the strength of the change that decides whether the eye
+        finds the grid.
+        """
+        total = 0
+        for y in range(0, a.height(), 3):
+            for x in range(0, a.width(), 3):
+                pa, pb = a.pixel(x, y), b.pixel(x, y)
+                if pa != pb:
+                    for shift in (0, 8, 16):
+                        total += abs(((pa >> shift) & 255) - ((pb >> shift) & 255))
+        return total
+
+    changed = differing(plain, gridded)
+    check("the grid is drawn at all", changed > 0, f"ink {changed}")
+
+    # and it is drawn heavily enough to see: the old hairline at alpha 55 is
+    # the thing being measured against, not an arbitrary threshold.  Each
+    # comparison re-takes its own grid-off shot, so nothing but the pen differs
+    # between the two - a stale one would carry any layout change into both
+    # numbers and flatten the ratio.
+    import scanforge.ui.canvas as canvas_mod
+    now = canvas_mod.GRID_PEN
+    try:
+        canvas_mod.GRID_PEN = (QColor(0, 255, 200, 55), 1.0)
+        win.toggle_grid(False)
+        pump()
+        base_faint = paint(c)
+        win.toggle_grid(True)
+        pump()
+        faint = differing(base_faint, paint(c))
+    finally:
+        canvas_mod.GRID_PEN = now
+    win.toggle_grid(False)
+    pump()
+    base_strong = paint(c)
+    win.toggle_grid(True)
+    pump()
+    strong = differing(base_strong, paint(c))
+    check("and it reads more strongly than the hairline it replaced",
+          strong > faint * 2.0,
+          f"ink {strong} now against {faint} for the old hairline "
+          f"({strong / max(1, faint):.1f}x)")
+    win.toggle_grid(False)
+    pump()
+
+    check("the page grid never drops to a single column",
+          win.queue.columns_for_width(win.queue.width()) >= 2,
+          f"{win.queue.columns_for_width(win.queue.width())} columns at "
+          f"{win.queue.width()} px")
+    check("and the panel enforces that as its own minimum",
+          win.queue.minimumWidth() >= win.queue.width_for_columns(2),
+          f"{win.queue.minimumWidth()} vs "
+          f"{win.queue.width_for_columns(2)}")
+    check("the splitter handle is wide enough to catch",
+          win.splitter.handleWidth() >= 8, str(win.splitter.handleWidth()))
+    check("and the panels cannot be collapsed to nothing by accident",
+          not win.splitter.childrenCollapsible())
+
+    # ------------------------------------------------------- un-marking done
+    print("\nun-marking a page")
+    win.queue.list.clearSelection()
+    first = win.project.pages[0]
+    win.queue.select(first.uid)
+    pump()
+    was = first.done
+    win.toggle_done_selection()
+    check("the done mark can be flipped on", first.done != was, str(first.done))
+    win.toggle_done_selection()
+    check("and flipped straight back off again", first.done == was,
+          str(first.done))
+
+    first.done = True
+    win.queue.refresh_item(first.uid)
+    win.toggle_done_selection()
+    check("a finished page can be un-finished", not first.done)
+    win.undo()
+    pump()
+    check("and undo puts the mark back", first.done, str(first.done))
+    win.undo()
+    pump()
+    first.done = was
+    win.queue.refresh_item(first.uid)
+
+    # the inspector's own tick is undoable too - it was the one edit that
+    # could not be taken back
+    win.queue.select(first.uid)
+    pump()
+    steps = len(win.history._undo)
+    win._set_done(not first.done)
+    check("the inspector's done tick records an undo step",
+          len(win.history._undo) > steps,
+          f"{steps} -> {len(win.history._undo)}")
+    win.undo()
+    pump()
+    check("so unticking it can be taken back", first.done == was,
+          str(first.done))
 
     # ------------------------------------------------------------- cutting
     print("\ncutting and joining")
@@ -1727,8 +2268,12 @@ def main():
     win.reset_page()
     pump()
 
-    win.auto_deskew()
-    check("auto-deskew runs off the GUI thread", "deskew" in win._busy,
+    # auto straighten + crop is the only automatic pass now: the deskew-only
+    # button measured the same skew and then did less with it
+    check("the deskew-only button is gone", not hasattr(win, "a_deskew")
+          and not hasattr(win, "auto_deskew"))
+    win.auto_both()
+    check("the automatic pass runs off the GUI thread", "auto" in win._busy,
           str(win._busy))
     # a second slow action while one is running must be refused, not stacked
     win.fit_to_page()
@@ -1736,9 +2281,12 @@ def main():
           str(win._busy))
     check("the refusal is explained", "Busy" in win.statusBar().currentMessage(),
           win.statusBar().currentMessage())
-    check("auto-deskew finishes", wait_until(idle, 30), "timed out")
-    check("auto-deskew found the 0.4° skew", abs(win._current.angle + 0.4) < 0.05,
+    check("the automatic pass finishes", wait_until(idle, 30), "timed out")
+    check("and it found the 0.4° skew", abs(win._current.angle + 0.4) < 0.05,
           f"{win._current.angle:+.3f}°")
+    check("the strip followed the angle it set",
+          abs(win.angle_strip.spin.value() - win._current.angle) < 1e-6,
+          f"{win.angle_strip.spin.value():+.3f}°")
 
     win.fit_to_page()
     check("fit-to-page finishes", wait_until(idle, 30), "timed out")
@@ -1747,14 +2295,22 @@ def main():
         w, h = win._current.output_size()
         check("crop is inside the sheet", 2000 < w < 2260 and 2900 < h < 3260,
               f"{w}x{h} (sheet is 2220x3220)")
-    # the spread pages are locked by now, so they are meant to differ
-    following = {p.output_size() for p in win.project.pages
-                 if p.crop_mode != "locked"}
-    check("fit-to-page propagated to every page that follows the shared crop",
-          len(following) == 1, str(following))
-    check("uniform_size ignores the locked pages",
+    # fit-to-page is a per-page action: it finds this sheet, and says nothing
+    # about any other
+    before_fit = {p.uid: p.output_size() for p in win.project.pages
+                  if p is not win._current}
+    check("fit-to-page changed only the page it ran on",
+          all(p.output_size() == before_fit[p.uid]
+              for p in win.project.pages if p is not win._current))
+    # give the document one size again with the tool that exists for it, and
+    # check the locked pages still sit out of the reckoning
+    win.project.apply_crop_to_all(win._current)
+    check("crop-all makes the document uniform again",
           win.project.uniform_size() is not None,
           str(win.project.uniform_size()))
+    check("and uniform_size ignores the locked pages",
+          win.project.uniform_size() == win._current.output_size(),
+          f"{win.project.uniform_size()} vs {win._current.output_size()}")
 
     # -------------------------------------------------------------- project
     print("\nproject persistence")
@@ -1765,7 +2321,8 @@ def main():
     check("project reloads all pages", len(loaded.pages) == len(win.project.pages))
     check("crops survive the round trip",
           loaded.pages[0].crop == win.project.pages[0].crop)
-    check("link setting survives", loaded.link_crop == win.project.link_crop)
+    check("the retired link setting is not written back out",
+          not hasattr(loaded, "link_crop"))
     check("crop mode survives",
           [p.crop_mode for p in loaded.pages] ==
           [p.crop_mode for p in win.project.pages])

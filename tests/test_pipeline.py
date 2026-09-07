@@ -342,7 +342,7 @@ def test_spread_crop_survives():
 
     # the user now goes to another page and nudges its crop
     proj.pages[0].crop = [110.0, 105.0, 2000.0, 3000.0]
-    n = proj.apply_linked_crop(proj.pages[0])
+    n = proj.apply_crop_to_all(proj.pages[0])
     check("the shared crop still reaches the unlocked page",
           proj.pages[3].crop == [110.0, 105.0, 2000.0, 3000.0], str(proj.pages[3].crop))
     check("but leaves the left spread page alone", left.crop == saved[0],
@@ -353,7 +353,7 @@ def test_spread_crop_survives():
 
     # a locked page must not push its crop outward either
     left.crop = [10.0, 10.0, 500.0, 500.0]
-    n = proj.apply_linked_crop(left)
+    n = proj.apply_crop_to_all(left)
     check("a locked page does not propagate its own crop", n == 0, str(n))
     check("the others are unchanged",
           proj.pages[3].crop == [110.0, 105.0, 2000.0, 3000.0])
@@ -361,7 +361,7 @@ def test_spread_crop_survives():
     # own_position still keeps x/y but takes the shared size
     proj.pages[3].crop_mode = "own_position"
     proj.pages[3].crop = [500.0, 600.0, 111.0, 222.0]
-    proj.apply_linked_crop(proj.pages[0])
+    proj.apply_crop_to_all(proj.pages[0])
     check("own_position keeps its place",
           proj.pages[3].crop[:2] == [500.0, 600.0], str(proj.pages[3].crop))
     check("own_position takes the shared size",
@@ -411,7 +411,7 @@ def test_project_paths_and_naming():
     proj.clear()
     check("clearing empties the project",
           not proj.pages and not proj.document_name and not proj.last_folder
-          and not proj.path and proj.link_crop)
+          and not proj.path)
 
 
 def test_zip_package():
@@ -443,11 +443,25 @@ def test_zip_package():
               all("/" not in n and "\\\\" not in n for n in names), str(names))
         check("the PDF is not inside it",
               not any(n.lower().endswith(".pdf") for n in names), str(names))
-    check("the loose files are still there",
-          os.path.exists(os.path.join(out_dir, "Sony_KV-16G1-0001.tif")))
+    # the loose pages went into the zip and the PDF and were then taken away:
+    # that is the default now, because the project file already holds the
+    # edits against the untouched scans
+    check("the loose files are not left behind by default",
+          not os.path.exists(os.path.join(out_dir, "Sony_KV-16G1-0001.tif")))
     check("the PDF sits beside the zip",
           os.path.exists(os.path.join(out_dir, "Sony_KV-16G1.pdf")))
     check("zipping is on by default", ExportSettings().zip_images is True)
+    check("keeping the loose pages is not", ExportSettings().keep_images is False)
+
+    keep_dir = os.path.join(out_dir, "kept")
+    os.makedirs(keep_dir, exist_ok=True)
+    b2 = BatchExporter(pages, ExportSettings(
+        out_dir=keep_dir, document="Sony_KV-16G1", zip_images=True,
+        make_pdf=True, pdf_dpi=100, workers=1, keep_images=True))
+    b2.run()
+    check("and asking for them keeps them beside the bundles",
+          os.path.exists(os.path.join(keep_dir, "Sony_KV-16G1-0001.tif"))
+          and os.path.exists(os.path.join(keep_dir, "Sony_KV-16G1.pdf")))
 
 
 def test_orientation_export():
@@ -887,6 +901,134 @@ def test_size_matching():
               proj2.size_groups(tolerance=5, include_locked=True)) == 4)
 
 
+def test_export_bundles_only():
+    """The per-page files can be a means to an end rather than the end."""
+    print("\nexporting without keeping the page files")
+    src = make_scan(w=1200, h=1600, skew=0.1, margin=50)
+    edits = []
+    for i in range(3):
+        p = os.path.join(TMP, f"bundle_{i}.tif")
+        iio.write_tiff(p, src, dpi=600, compression="zlib")
+        e = PageEdit(path=p, src_w=1200, src_h=1600, dpi=600.0)
+        e.set_crop_rect(Rect(60, 70, 1000, 1400))
+        edits.append(e)
+
+    def run(label, **kw):
+        out = os.path.join(TMP, "bundle_out_" + label)
+        os.makedirs(out, exist_ok=True)
+        cfg = ExportSettings(out_dir=out, document="Manual", **kw)
+        ex = BatchExporter(edits, cfg)
+        res = ex.run()
+        return sorted(os.listdir(out)), res
+
+    left, res = run("zip", zip_images=True, make_pdf=False, keep_images=False)
+    check("a zip-only export leaves the zip and nothing else",
+          left == ["Manual-images.zip"], str(left))
+    check("and every page still counted as exported",
+          sum(1 for r in res if r.ok) == 3, str(len(res)))
+    import zipfile
+    with zipfile.ZipFile(os.path.join(TMP, "bundle_out_zip",
+                                      "Manual-images.zip")) as z:
+        check("the pages really are inside it", len(z.namelist()) == 3,
+              str(z.namelist()))
+
+    left, _ = run("both", zip_images=True, make_pdf=True, keep_images=False)
+    check("a zip + PDF export leaves both and no loose pages",
+          left == ["Manual-images.zip", "Manual.pdf"], str(left))
+
+    left, _ = run("kept", zip_images=True, make_pdf=False, keep_images=True)
+    check("asking to keep them keeps them",
+          len([f for f in left if f.endswith(".tif")]) == 3, str(left))
+
+
+def test_decode_routes():
+    """Every route to a proxy must give the same picture, and the progress it
+    reports must be the truth about how far along it is."""
+    print("\ndecode routes and what the bar says")
+    import tifffile
+
+    h, w = 3000, 2300                      # not a multiple of any tile size
+    rng = np.random.default_rng(4)
+    base = np.clip(np.repeat(np.linspace(190, 250, w)[None, :], h, axis=0)
+                   + rng.normal(0, 6, (h, w)), 0, 255)
+    for y in range(200, h - 200, 40):
+        base[y:y + 12, 150:w - 150] = 40
+    rgb8 = np.dstack([base] * 3).astype(np.uint8)
+    rgb16 = (np.dstack([base] * 3) * 257).astype(np.uint16)
+
+    cases = {
+        "tiled deflate":  (rgb8, dict(tile=(512, 512), compression="zlib")),
+        "striped deflate": (rgb8, dict(rowsperstrip=64, compression="zlib")),
+        "one big strip":  (rgb8, dict(rowsperstrip=h, compression="zlib")),
+        "16-bit tiled":   (rgb16, dict(tile=(512, 512), compression="zlib")),
+        "jpeg tiles":     (rgb8, dict(tile=(512, 512), compression="jpeg")),
+        "uncompressed":   (rgb8, dict(rowsperstrip=64)),
+        "separate planes": (np.ascontiguousarray(rgb8.transpose(2, 0, 1)),
+                            dict(planarconfig="separate", rowsperstrip=64,
+                                 photometric="rgb", compression="zlib")),
+    }
+    ref = None
+    for name, (arr, kw) in cases.items():
+        p = os.path.join(TMP, "route_" + name.replace(" ", "_")
+                         .replace("-", "") + ".tif")
+        tifffile.imwrite(p, arr, resolution=(600, 600), **kw)
+        marks = []
+        out = proxycache._decode(p, 900, lambda f: marks.append(f))
+        route = proxycache.last_strategy[os.path.basename(p)][0]
+        check(f"{name}: decoded to the right shape",
+              out.shape[:2] == (900, 690), f"{route}, {out.shape}")
+        check(f"{name}: progress only ever goes forwards",
+              all(b >= a for a, b in zip(marks, marks[1:])) and marks,
+              f"{len(marks)} reports")
+        check(f"{name}: the bar reaches the end",
+              marks and abs(marks[-1] - 1.0) < 1e-6,
+              f"ends at {marks[-1] * 100:.0f}%" if marks else "silent")
+        if ref is None:
+            ref = out.astype(int)
+        elif out.shape == ref.shape:
+            check(f"{name}: same picture as the first route",
+                  abs(out.astype(int) - ref).mean() < 6.0,
+                  f"{abs(out.astype(int) - ref).mean():.2f} levels apart")
+
+    # the three routes are picked, not fixed: an uncompressed TIFF is read
+    # whole because that is four times faster, a compressed one is walked
+    big = os.path.join(TMP, "route_tiled_deflate.tif")
+    raw = os.path.join(TMP, "route_uncompressed.tif")
+    check("a compressed scan is walked segment by segment",
+          proxycache._plan(big, 900, proxycache._layout(big))
+          in ("paste", "accumulate"))
+    check("an uncompressed scan is read whole",
+          proxycache._plan(raw, 900, proxycache._layout(raw)) == "whole")
+
+    # and the walk gives up its full-size array when memory is short
+    lay = proxycache._layout(big)
+    real_mem = proxycache.available_memory
+    try:
+        proxycache.available_memory = lambda: lay["stored"] * 10
+        check("with room to spare it pastes and resizes once",
+              proxycache._plan(big, 900, lay) == "paste")
+        proxycache.available_memory = lambda: lay["stored"] // 2
+        check("with memory short it averages into the small array instead",
+              proxycache._plan(big, 900, lay) == "accumulate")
+    finally:
+        proxycache.available_memory = real_mem
+
+    # the bar must not sit full while the tiers are still being written
+    proxycache.clear([big])
+    marks = []
+    proxycache.build(big, tiers=("thumb", "proxy"), force=True,
+                     on_progress=lambda f: marks.append(f))
+    full = [i for i, f in enumerate(marks) if f >= 0.999]
+    check("the bar only fills once the cache files are actually written",
+          full and full[0] == len(marks) - 1,
+          f"first reached 100% at report {full[0] + 1} of {len(marks)}"
+          if full else "never reached 100%")
+    tail = [f for f in marks if 0.8 < f < 0.999]
+    check("writing the tiers moves the bar rather than happening behind a "
+          "full one", len(tail) >= 2,
+          " ".join(f"{f * 100:.0f}%" for f in tail))
+
+
 def test_decode_economy():
     """Importing a folder must decode each scan exactly once."""
     print("\ndecoding each scan once")
@@ -1084,6 +1226,8 @@ def main():
     test_cut_pages()
     test_join_pages()
     test_size_matching()
+    test_export_bundles_only()
+    test_decode_routes()
     test_decode_economy()
     path, proxy, skew = test_detection_and_proxies()
     e = test_full_res_export(path, proxy, skew)

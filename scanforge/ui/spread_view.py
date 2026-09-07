@@ -16,12 +16,15 @@ import numpy as np
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (QCheckBox, QDoubleSpinBox, QGroupBox,
-                               QHBoxLayout, QLabel, QPushButton, QSpinBox,
-                               QVBoxLayout, QWidget)
+                               QHBoxLayout, QLabel, QPushButton, QScrollArea,
+                               QSpinBox, QVBoxLayout, QWidget)
 
 from ..geometry import rotation_matrix, rotated_size
 from ..model import PageEdit
 from .canvas import numpy_to_pixmap, qtransform_from_affine, remap_crop_for_angle
+
+HANDLE_PX = 9.0                      # drawn size and grab tolerance, screen px
+MIN_CROP = 40.0                      # never resize a page down to nothing
 
 
 class SpreadView(QWidget):
@@ -33,7 +36,9 @@ class SpreadView(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(700, 460)
+        # a small floor: the view is zoomable, and a large minimum here
+        # squeezed the queue panel down to a single column
+        self.setMinimumSize(380, 300)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMouseTracking(True)
 
@@ -49,6 +54,10 @@ class SpreadView(QWidget):
         self.guides: list = []           # horizontal lines, spread-space y
         self.vguides: list = []
         self.link_vertical = False       # move both pages together
+        # Keep both crops the same size.  A bound spread is two halves of one
+        # sheet: whatever the scanner did, the finished pages have to be the
+        # same size or the book reads as if it were assembled from offcuts.
+        self.link_size = False
 
         self._zoom = 0.25
         self._pan = QPointF(30, 30)
@@ -114,6 +123,17 @@ class SpreadView(QWidget):
 
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
+        # Hold whatever is in the middle of the window in the middle of the
+        # window.  Without this the pan is left over from the size the widget
+        # had before it was laid out, and anything positioned from the view -
+        # a new guide, for one - lands somewhere off screen.
+        old = ev.oldSize()
+        if old.width() > 0 and old.height() > 0:
+            self._pan += QPointF((self.width() - old.width()) / 2.0,
+                                 (self.height() - old.height()) / 2.0)
+        else:
+            self.fit()
+        self.update()
 
     def wheelEvent(self, ev):
         d = ev.angleDelta().y()
@@ -166,6 +186,12 @@ class SpreadView(QWidget):
             p.setPen(QPen(QColor(255, 200, 60) if on else QColor(150, 155, 165),
                           px * (2.2 if on else 1.2)))
             p.drawRect(r)
+            # the frame is draggable by its edges, so it says so
+            hs = HANDLE_PX * px
+            p.setBrush(QColor(255, 255, 255) if on else QColor(190, 195, 205))
+            p.setPen(QPen(QColor(20, 24, 30), px))
+            for hx, hy in self._handle_points(r):
+                p.drawRect(QRectF(hx - hs / 2, hy - hs / 2, hs, hs))
 
     def _draw_page(self, p: QPainter, side: str) -> None:
         e = self.edit_for(side)
@@ -201,6 +227,81 @@ class SpreadView(QWidget):
         blit(1.0)
         p.restore()
 
+    # ----------------------------------------------------------- crop handles
+    _HANDLES = ["tl", "t", "tr", "r", "br", "b", "bl", "l"]
+    _HANDLE_CURSORS = [Qt.SizeFDiagCursor, Qt.SizeVerCursor, Qt.SizeBDiagCursor,
+                       Qt.SizeHorCursor, Qt.SizeFDiagCursor, Qt.SizeVerCursor,
+                       Qt.SizeBDiagCursor, Qt.SizeHorCursor]
+
+    @staticmethod
+    def _handle_points(r: QRectF) -> list:
+        cx, cy = r.center().x(), r.center().y()
+        return [(r.left(), r.top()), (cx, r.top()), (r.right(), r.top()),
+                (r.right(), cy), (r.right(), r.bottom()), (cx, r.bottom()),
+                (r.left(), r.bottom()), (r.left(), cy)]
+
+    def _hit_handle(self, sp: QPointF):
+        """Which page frame's handle is under the cursor, if any.
+
+        The active page is asked first: the two frames touch at the gutter, so
+        the handles either side of it overlap, and without a rule the page you
+        are working on would lose its own edge to its neighbour.
+        """
+        tol = (HANDLE_PX * 0.85) / max(self._zoom, 1e-6)
+        order = [self.active, "right" if self.active == "left" else "left"]
+        for side in order:
+            r = self.crop_spread(side)
+            if not r.width():
+                continue
+            for i, (hx, hy) in enumerate(self._handle_points(r)):
+                if abs(sp.x() - hx) <= tol and abs(sp.y() - hy) <= tol:
+                    return side, self._HANDLES[i], i
+        return None, None, -1
+
+    def _resize_crop(self, side: str, handle: str, orig: list,
+                     dx: float, dy: float) -> None:
+        """Move one edge of a page's crop, in that page's own pixels."""
+        e = self.edit_for(side)
+        if e is None:
+            return
+        x, y, w, h = orig
+        if "l" in handle:
+            x, w = x + dx, w - dx
+        if "r" in handle:
+            w = w + dx
+        if "t" in handle:
+            y, h = y + dy, h - dy
+        if "b" in handle:
+            h = h + dy
+        if w < MIN_CROP:
+            if "l" in handle:
+                x -= MIN_CROP - w
+            w = MIN_CROP
+        if h < MIN_CROP:
+            if "t" in handle:
+                y -= MIN_CROP - h
+            h = MIN_CROP
+        e.crop = [x, y, w, h]
+
+    def _apply_size_link(self, source: str) -> None:
+        """Carry the source page's size across, leaving the other page where
+        it is.
+
+        Size only: the two pages sit at their own positions over their own
+        scans, and a spread is made consistent by making the pages the same
+        shape, not by dragging one of them onto the other.
+        """
+        if not self.link_size:
+            return
+        a = self.edit_for(source)
+        b = self.edit_for("right" if source == "left" else "left")
+        if a is None or b is None or not a.crop or not b.crop:
+            return
+        if b.crop[2] == a.crop[2] and b.crop[3] == a.crop[3]:
+            return
+        b.crop[2] = a.crop[2]
+        b.crop[3] = a.crop[3]
+
     # ------------------------------------------------------------------ mouse
     def mousePressEvent(self, ev):
         pos = QPointF(ev.position())
@@ -219,6 +320,16 @@ class SpreadView(QWidget):
             if abs(sp.x() - x) <= tol:
                 self._drag = ("vguide", i)
                 return
+        side, handle, _i = self._hit_handle(sp)
+        if side is not None:
+            if side != self.active:
+                self.active = side
+                self.activeChanged.emit(side)
+            self._drag = ("resize",
+                          (side, handle, sp, list(self.edit_for(side).crop)))
+            self.update()
+            return
+
         for side in ("left", "right"):
             if self.crop_spread(side).contains(sp):
                 if side != self.active:
@@ -233,6 +344,11 @@ class SpreadView(QWidget):
         pos = QPointF(ev.position())
         sp = self._to_spread(pos)
         if self._drag is None:
+            _side, _h, i = self._hit_handle(sp)
+            if i >= 0:
+                self.setCursor(self._HANDLE_CURSORS[i])
+            else:
+                self.unsetCursor()
             return
         kind, data = self._drag
         if kind == "pan":
@@ -246,6 +362,21 @@ class SpreadView(QWidget):
             return
         if kind == "vguide":
             self.vguides[data] = sp.x()
+            self.update()
+            return
+        if kind == "resize":
+            side, handle, start, orig = data
+            s = self._scale.get(side, 1.0)
+            self._resize_crop(side, handle, orig,
+                              (sp.x() - start.x()) / s, (sp.y() - start.y()) / s)
+            self._apply_size_link(side)
+            e = self.edit_for(side)
+            other = self.edit_for("right" if side == "left" else "left")
+            note = f"{side} page  {e.crop[2]:.0f} × {e.crop[3]:.0f} px"
+            if self.link_size and other is not None and other.crop:
+                note += "   · both pages linked"
+            self.statusMessage.emit(note)
+            self.changed.emit()
             self.update()
             return
         if kind == "move":
@@ -320,16 +451,41 @@ class SpreadView(QWidget):
 
     # ------------------------------------------------------------------- ops
     def add_guide(self, horizontal: bool = True) -> None:
-        W, H = self.spread_size()
+        """Drop a guide across the middle of what is on screen.
+
+        The middle of the *spread* is the wrong place: zoomed in on the top of
+        two pages, a guide placed at the spread's centre lands somewhere below
+        the window and has to be hunted for.  A guide should appear where you
+        are looking.
+        """
+        centre = self._to_spread(QPointF(self.width() / 2.0,
+                                         self.height() / 2.0))
+        # successive guides step apart by a fixed number of *screen* pixels, so
+        # a second one is never hidden exactly under the first at any zoom
+        step = 30.0 / max(self._zoom, 1e-6)
         if horizontal:
-            self.guides.append(H / 2.0 + len(self.guides) * 40)
+            self.guides.append(centre.y() + len(self.guides) * step)
         else:
-            self.vguides.append(W / 2.0)
+            self.vguides.append(centre.x() + len(self.vguides) * step)
         self.update()
 
     def clear_guides(self) -> None:
         self.guides.clear()
         self.vguides.clear()
+        self.update()
+
+    def set_link_size(self, on: bool) -> None:
+        """Turn the size link on or off.
+
+        Turning it on equalises the pages there and then, from the active one.
+        A link that only takes effect on the next drag is not a link; it is a
+        promise, and the spread would sit there mismatched while claiming to be
+        joined up.
+        """
+        self.link_size = bool(on)
+        if self.link_size:
+            self._apply_size_link(self.active)
+            self.changed.emit()
         self.update()
 
     def match_size(self, dimension: str = "height") -> None:
@@ -411,10 +567,30 @@ class SpreadPane(QWidget):
         root.addWidget(self.status)
         self.view.statusMessage.connect(self.status.setText)
 
-        root.addLayout(self._controls())
+        # The control strip is a row of group boxes, and its combined minimum
+        # width is what used to set the whole pane's minimum - which the
+        # splitter then took out of the page queue, squeezing it to a single
+        # column and leaving it there.  In a scroll area it asks for nothing.
+        bar = QWidget()
+        bar.setLayout(self._controls())
+        scroll = QScrollArea()
+        scroll.setWidget(bar)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setMinimumWidth(120)
+        scroll.setFixedHeight(bar.sizeHint().height() + 14)
+        root.addWidget(scroll)
         self.view.changed.connect(self._refresh)
         self.view.activeChanged.connect(lambda _s: self._refresh())
         self._refresh()
+
+    def _set_link_size(self, on: bool) -> None:
+        self.view.set_link_size(on)
+        if on:
+            self.status.setText(
+                "Sizes linked — both pages follow whichever crop you resize")
 
     def _controls(self) -> QHBoxLayout:
         bar = QHBoxLayout()
@@ -459,6 +635,15 @@ class SpreadPane(QWidget):
         b_top = QPushButton("Align tops")
         b_top.clicked.connect(self.view.align_tops)
         hs.addWidget(b_top)
+        self.chk_link_size = QCheckBox("Link")
+        self.chk_link_size.setToolTip(
+            "Keep both pages the same size. Drag either crop frame by its "
+            "handles and the other follows — size only, so each page stays "
+            "where it sits over its own scan.\nTurning it on matches the "
+            "other page to the active one straight away.")
+        self.chk_link_size.setChecked(self.view.link_size)
+        self.chk_link_size.toggled.connect(self._set_link_size)
+        hs.addWidget(self.chk_link_size)
         bar.addWidget(g_size)
 
         g_view = QGroupBox("View")

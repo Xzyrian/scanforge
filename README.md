@@ -49,14 +49,43 @@ million pixels every time you drag something. ScanForge never does.
   carry on with whatever loaded. That button cannot be reached while pages are
   still arriving. **Cancel** is separate and always available: it abandons the
   import outright and takes the pages back out of the project.
-* **The percentage on each page is real.** A tiled TIFF is decoded a tile at a
-  time, so there is something honest to report several times a second rather
-  than an animation that only means "still working". Reading it that way also
-  turned out to be *faster* — 2.3 s against 3.5 s on a 140 MP scan, and 637 MB
-  peak against 964 MB, because the full-size array is never built at all: each
-  tile is reduced into the small one and dropped. Files that are not tiled
-  TIFFs fall back to the plain path and an indeterminate bar, which is the
-  honest thing to show when nothing can be measured.
+* **The percentage on each page is real** — it counts segments actually
+  decoded. A compressed TIFF is walked strip by strip or tile by tile, so there
+  is something honest to report several times a second rather than an animation
+  that only means "still working". A file with nothing to count — a single-strip
+  TIFF, a JPEG — gets an indeterminate bar instead, which is the honest thing to
+  show when nothing can be measured.
+* **The bar does not fill before the work is done.** The decode owns the first
+  88% and writing the cache files owns the rest. Encoding three tiers of JPEG
+  for a 140 MP page is around half a second, and it used to happen with the bar
+  already sitting on 100%, which looks exactly like a hang.
+* **The route through the file is chosen per file, not fixed.** Measured on a
+  108 MP page, warm cache, best of three:
+
+  | layout | average into the small array | paste, resize once | read whole |
+  |---|---|---|---|
+  | tiled Deflate | 0.97 s / 312 MB | **0.65 s** / 566 MB | 0.66 s / 565 MB |
+  | striped Deflate | 0.83 s / 311 MB | **0.57 s** / 565 MB | 0.59 s / 563 MB |
+  | striped LZW | 2.52 s / 398 MB | 3.10 s / 650 MB | **2.51 s** / 648 MB |
+  | uncompressed | 0.89 s / 686 MB | 0.53 s / 890 MB | **0.21 s** / 397 MB |
+
+  So an uncompressed TIFF is read whole — `tifffile` maps it straight off the
+  disk, which is four times faster *and* smaller than walking it. Anything
+  compressed is walked, because that is what makes the percentage possible; each
+  segment is pasted into a full-size array when there is memory to spare, and
+  averaged into the small one when there is not — 45% less memory for about 40%
+  more time. The earlier version always did the averaging, which is why importing
+  got slower than it needed to be.
+* **Running out of memory does not fall back to the greediest path.** A walk that
+  hits `MemoryError` drops the decode limit and retries the *smaller* walk. It
+  used to fall through to reading the whole file, which is the one thing that
+  cannot possibly work when memory has already run out — and because the failure
+  was swallowed, the page was silently decoded twice.
+* **`tools/decode_report.py` says what actually happened** to a given scan: how
+  it is stored, which route was picked and why, where the percentage paused and
+  for how long, and — with `--all` — every route timed on that file. It is the
+  thing to run when a bar behaves oddly, because the answer is usually specific
+  to the file rather than to the program.
 * **When something is running, it says so**: a spinner in the status bar, and a
   panel over the canvas naming what is being waited on.
 * **Full resolution is touched once, at export**, in a worker pool with a
@@ -96,6 +125,19 @@ Importing three 140 MP scans, same machine, before and after the decode work:
 | Two jobs per file, threaded decode, three at once | 15.8 s | 2.7 GB |
 | One job per file, gated | 10.1 s | 0.97 GB |
 
+Choosing the route per file rather than always averaging into the small array,
+importing three 108 MP scans on the same container:
+
+| Source | Always averaging | Route chosen |
+|---|---|---|
+| Tiled Deflate | 3.50 s / 376 MB | 3.13 s / 629 MB |
+| Uncompressed | 2.99 s / 751 MB | **0.81 s / 459 MB** |
+
+The uncompressed row is where it matters — nearly four times faster on *less*
+memory. For a compressed scan the decode itself gets about 30% quicker but the
+decode is only a third of an import, so the end-to-end gain is around 10%, paid
+for in memory; that is why it is conditional on there being memory to spare.
+
 The memory column is the one that matters: 2.7 GB of decode buffers for three
 pages is what pushes a real machine into swap, and swapping is what "it lags a
 ton while importing" actually feels like.
@@ -118,19 +160,33 @@ you want if something goes wrong. `run-tests.bat` runs the full test suite.
 
 ## Building an executable to share
 
-Run **`build-exe.bat`**. It installs PyInstaller into the same `.venv`, draws
-the application icon, builds, and — the part that matters — **runs the built
-executable's own self-test before declaring success**. If a codec or a Qt piece
-failed to get bundled, the build is reported as broken rather than handed to you
-looking fine.
+Run **`build-exe.bat`**. Eight steps, in this order:
+
+1. Warn if two OpenCV wheels are installed (that alone adds ~150 MB).
+2. Bring `.venv` up to date with `requirements.txt`, and install PyInstaller.
+3. **Self-test the source tree first.** Two minutes here beats ten minutes of
+   PyInstaller followed by the discovery that the source was already broken.
+4. Draw the application icon.
+5. **Delete `build\` and `dist\`.** Without this a failed build leaves the last
+   good exe sitting in `dist\`, and the steps below test and zip *that* — which
+   is how a stale build gets shipped.
+6. Build.
+7. **Run the built executable's own self-test.** If a codec or a Qt piece
+   failed to get bundled, the build is reported as broken rather than handed to
+   you looking fine. The exe is a windowed build with no console to print to, so
+   it writes its report to `dist\selftest.log` and the script prints that.
+8. Zip it.
 
 You get `dist\ScanForge\ScanForge.exe` plus `dist\ScanForge-windows.zip`.
 Whoever you send it to unzips it and runs the .exe — no Python, no install.
 
-`build-exe.bat onefile` produces a single self-contained `ScanForge.exe`
-instead. It is smaller to send but unpacks itself into a temp folder on every
-launch, so it starts several seconds slower. The folder build is the better
-default; onefile is for when you need to hand over exactly one file.
+Arguments, in any combination:
+
+| Argument | Effect |
+| --- | --- |
+| `onefile` | One self-contained `ScanForge.exe` instead of a folder. Smaller to send, but it unpacks itself into a temp folder on every launch, so it starts several seconds slower. The folder build is the better default. |
+| `quick` | Skip step 3. Only worth it when you have just run `run-tests.bat`. |
+| `nopause` | Do not wait for a keypress at the end, for calling it from another script. |
 
 Expect roughly 300 MB unpacked, most of it Qt, OpenCV and the TIFF codecs.
 Nothing is stripped that the app can actually reach: the codec set is kept whole
@@ -138,10 +194,17 @@ so it can still open oddly-compressed vintage TIFFs.
 
 ### The self-test
 
-`ScanForge.exe --selftest` runs it any time. It checks numpy, OpenCV, every TIFF
-compression the export dialog offers, Pillow, PDF assembly, the full render
-pipeline (crop + rotate + blur), page detection, and that the window and all its
-icons actually build.
+`ScanForge.exe --selftest` runs it any time, and `python tools\freeze_check.py`
+runs the same checks against the source tree (`run-tests.bat` does this as its
+third step). It checks numpy, OpenCV, every TIFF compression the export dialog
+offers, Pillow, PDF assembly, the full render pipeline (crop + rotate + blur),
+joined pages, page detection, the lazily-imported dialogs, and that the window
+and all its icons actually build.
+
+The report is always written to a file as well as printed, because a windowed
+PyInstaller build has no stdout — `print` goes nowhere — which made the one
+moment the report mattered most the moment it was invisible. The path is
+`%TEMP%\scanforge-selftest.log`, or wherever `SCANFORGE_SELFTEST_LOG` points.
 
 This exists because a frozen build fails in a specific way: everything imports
 perfectly from source, then the .exe runs and some C extension PyInstaller never
@@ -161,7 +224,14 @@ suspicious than the size saving is worth.
 
 ## Getting scans in
 
-**Drag a folder onto the window.** That folder becomes the working folder: it
+**Drag a folder onto the window — anywhere in it.** The page itself, the page
+grid, the tool column, the chrome around them: all of it is a drop target. It
+used to be only the page grid, because a `QGraphicsView` switches drops on for
+its own viewport so it can hand them to items in the scene, and the canvas was
+accepting folders and then silently discarding them — which is unfortunate,
+since the middle of the window is exactly where you aim.
+
+That folder becomes the working folder: it
 sets the document name, seeds the file dialogs, and puts the default export
 destination **beside** the scan folder rather than inside it. Dropping loose
 files works too. Dropping a `.sfproj` opens that project.
@@ -175,40 +245,159 @@ onto `run.bat` to open it at launch.
 
 ---
 
-## The two tool bars
+## How the window is laid out
+
+Left to right, in the order the work flows:
+
+```
+ ┌─────────────────────────────────────────────────────────────┐
+ │  open save save-as export │ undo redo │ guides │ grid book  │
+ ├──────┬───────────────────────────────────┬──────────────────┤
+ │      │                                   │                  │
+ │ tool │          the scan                 │   page grid      │
+ │ col  │                                   │                  │
+ │      ├───────────────────────────────────┼──────────────────┤
+ │      │  angle  0.000°  0  ──────●──────  │   what is left   │
+ │      │                                   │   of the panel   │
+ ├──────┴───────────────────────────────────┴──────────────────┤
+ │  status · page 3 of 240 · x,y · [fit] ────●──── 61%         │
+ └─────────────────────────────────────────────────────────────┘
+```
+
+The tools act on the page, so they sit beside it. The page grid moved to the
+right, where you look to see where you are in the document rather than what you
+are doing to one sheet of it. The panel under the grid is a **holding position**
+— crop numbers, the reuse buttons and the blur controls have not been given
+homes yet, and it goes when they have. It scrolls rather than pushing the grid
+out of the column, and the grid keeps at least two rows of pages whatever the
+panel would like.
+
+The tool column sits outside the splitter: it is a fixed width, and a divider
+beside something that cannot be resized is a control that does nothing.
+
+---
+
+## The top bar and the tool column
 
 **Top bar** — open scan folder · save project · save project as · export ¦
-undo · redo ¦ show grid.
+undo · redo ¦ guide ― · guide │ · clear guides ¦ show grid · preview as a book.
 
-**Second bar** — selection tools: cursor · crop · alignment guide · blur · cut ¦
-page tools: link crops · copy framing · align spread ¦ auto tools: auto ·
-auto-deskew · fit to page edges ¦ zoom: fit · 100% ¦ mark done.
+That is the document and the view: what you are working on, and how you are
+looking at it. Nothing in the top bar changes a page.
+
+**Status bar, far right** — a **Fit** button and a **zoom slider** with the
+percentage beside it, where a zoom control is always looked for. The bar used to
+carry three readouts and nothing you could operate.
+
+There is no **100%** and no **50%**. Everything on screen is a 2200 px
+interpretation of a 10000 px scan, so "actual pixels" names something the editor
+never shows you; the number was a fiction and the two buttons spent toolbar
+space on it. The slider is logarithmic — the useful range runs from a whole
+140 MP page in a window (around 6%) up to a few hundred percent, and a linear
+slider spends nine tenths of its travel above 100% where nothing is ever set.
+
+**Tool column** — a column between the page grid and the canvas, two icons
+abreast, with a rule between each group:
+
+```
+  cursor   crop page     the tools; one is armed at a time
+  crop all blur
+  cut
+  ────────────────
+  rot ←    rot →         orientation, for a scan that arrived sideways
+  flip ⇄   flip ⇅
+  ────────────────
+  link     copy          framing, which reaches past this page
+  match    spread
+  join
+  ────────────────
+  auto     fit page      the automatic pass, and finding the sheet
+  ────────────────
+  done                   finish this page and move on
+```
+
+The tools act on the page in front of you, so they sit beside it. A bar across
+the top of the window puts the crop tool as far from the crop as the layout
+allows, and that is a trip your eye makes on every page of a two-hundred-page
+manual. Standing the bar on its end was not enough on its own — a `QToolBar`
+is only one button wide that way, and sixteen tools in single file is taller
+than most windows — hence two columns, which also lets the grouping show as
+whitespace and a rule rather than a separator you have to squint at.
+
+The grid is half-inch, drawn from the crop's own corner, and it is drawn at two
+screen pixels rather than one. It used to be a single hairline at alpha 55,
+which against a scan of white paper was invisible — and a measuring aid you
+cannot see is worse than none, because you believe you checked. Measured against
+the old pen on a rendered page, it now lays down six times the ink.
 
 Everything is a square icon; hover for the name and shortcut.
 
 ---
 
-## The first crop
+## Cropping
 
-A new project opens with the **crop tool already armed**. Drag out the crop for
-the document, it lands on every page at once, and then **both** the crop tool
-and the project-wide crop release themselves. That is the whole first step.
+Two tools, and the difference between them is how far the rectangle reaches:
 
-The project-wide crop exists to answer one question — what shape is this
-document — and it answers it the moment you draw that first rectangle. Leaving
-it switched on afterwards is what made careful per-page work disappear: every
-later nudge on any page was quietly copied over all the others. So it switches
-itself off, and the status bar says so. Turn it back on from the **link** button
-on the tool bar whenever you actually want a change to reach every page.
+* **Crop page (C)** — crops the page in front of you and nothing else.
+* **Crop all pages (Shift+C)** — draws one rectangle and gives it to every
+  page in the project.
 
-A click without a drag does nothing — it will not commit a one-pixel crop to the
-entire project.
+Both draw the same way, both release themselves after one drag, and **neither
+arms itself**. A new project opens on the cursor.
+
+A page you have not cropped shows a crop window around the whole sheet, with
+handles on its corners and edges, so cropping usually starts by pulling that
+frame in rather than drawing a rectangle from nothing. Drag an edge and the page
+is cropped — that is the crop-page action, done with the cursor.
+
+### What this replaced, and why
+
+There used to be a project-wide switch — *Same crop for every page* — that was
+**on by default**, so the first crop you drew went to the whole document and the
+tool armed itself when a project opened. It then switched itself off, on the
+theory that the first crop answers "what shape is this document" and later
+edits are per-page.
+
+Every part of that was a rule you had to know. The switch changed what a drag
+meant without being where you were looking; the arming decided for you what the
+first action would be; and the release depended on a piece of state that had to
+be re-derived after every undo, because a remembered flag did not survive one.
+Two tools say the same thing by name, at the moment you pick one, with nothing
+to remember and nothing happening behind you.
+
+Per-page settings still decide who *receives* a crop-all:
+
+* **Follows** — takes the whole rectangle. The default.
+* **Keeps its own position** — takes the width and height but stays where it
+  sits, so the pages match in size without moving the content.
+* **Locked** — sits out entirely, in both directions: it neither receives a
+  crop-all nor pushes its own onto anyone. Spread-aligned pages, cut halves and
+  joined pages are locked automatically, so a crop-all cannot destroy an
+  alignment you spent time on.
+
+A click without a drag does nothing — it will not commit a one-pixel crop, to
+this page or to two hundred of them.
+
+### Adjusting a crop once it is there
+
+Drag its handles in cursor mode. Arrow keys nudge by exactly 1 source pixel —
+Shift for 10, Alt to resize instead of move. The X/Y/W/H boxes are in
+full-resolution source pixels, and the Result panel shows the exact output size
+in pixels, inches and millimetres.
+
+**Fit to page edges (E)** finds the sheet against the scanner bed and pulls the
+crop just inside it. It deliberately trims a hair inside the paper edge, because
+a bounding box around a slightly skewed sheet always catches wedges of bed in
+the corners. Like every crop edit, it acts on the page it is run on.
+
+If you rotate a page after cropping, the crop follows the content rather than
+staying put in frame coordinates.
 
 ---
 
 ## Tools
 
-There are five, and only one is ever active:
+There are four, and only one is ever active:
 
 * **Cursor (V)** — the resting state. Pan, zoom, and drag the handles of a crop
   you already have. It **cannot** start a new rectangle, so a stray click on the
@@ -216,8 +405,6 @@ There are five, and only one is ever active:
 * **Crop (C)** — draw one new rectangle. The moment you release the mouse it
   hands control back to the cursor, so you have to arm it deliberately each
   time.
-* **Alignment guide (L)** — lay a straightedge across the page. It stays there;
-  see below.
 * **Blur (B)** — drag out a region to obscure. Also one-shot.
 * **Cut (X)** — split this scan into separate pages along a line you place.
 
@@ -242,46 +429,35 @@ straighten the page, and they are undoable like everything else.
 
 ---
 
-## One document, one crop
+## One document, many pages
 
 The whole queue is treated as pages of a single document — a brochure or a
 manual — not a folder of unrelated files. So there is one document name, set at
-export time (or with **Ctrl+G**), and one crop shared by every page.
+export time (or with **Ctrl+G**), and **Crop all pages** to give them one shape.
 
-The crop link is on when a project opens, because a scanned document is one
-object photographed many times and every page of an archival set should come out
-the same size. It turns **itself off** once that first crop has been applied to
-everything (see above), so the rest of your session is per-page by default.
+The queue footer confirms it — "all 9300×13304" — and turns to "sizes differ" if
+anything has drifted apart. For crops that are a few pixels out rather than
+wrong, **Match crop sizes** (Ctrl+Shift+M) is the gentler tool: it brings them
+onto one exact size without moving anything.
 
-While it is on, changing the crop anywhere lands it on every page in the
-project. The queue footer confirms it — "all 9300×13304" — and turns to "sizes
-differ" if anything has drifted apart.
+Each page chooses how a crop-all treats it, in the panel:
 
-The **link** button on the tool bar switches it on and off at any time. For
-crops that have already drifted a few pixels apart, **Match crop sizes**
-(Ctrl+Shift+M) is the gentler tool: it brings them onto one exact size without
-moving anything.
-
-Each page also chooses how it follows the shared crop, in the inspector:
-
-* **Follows the shared crop** — the default.
+* **Follows** — takes the whole rectangle. The default.
 * **Keeps its own position** — for a sheet that sat differently on the glass. It
-  keeps its own x/y but still takes the shared width and height, so sizes match.
+  keeps its own x/y but still takes the width and height, so sizes match.
 * **Locked — never overwritten** — completely exempt, in both directions.
 
 **Spread-aligned pages are locked automatically.** Their framing was set against
-their facing page, and the shared crop must not come along later and replace it.
-That is exactly what used to happen: aligning a spread, then nudging the crop on
-any unrelated page, silently destroyed the alignment. Locked pages show a 🔒 in
-the queue, and are excluded from the "all 9300×13304" size check since they are
-meant to differ.
+their facing page, and a crop-all must not come along later and replace it.
+Locked pages show a 🔒 in the queue, and are excluded from the "all 9300×13304"
+size check since they are meant to differ.
 
 ---
 
 ## Straightening to 0.01°
 
-* **Alignment guide (L)** — a straightedge you turn the page against, described
-  in its own section below. Most precise, usually fastest.
+* **Guides (Space, Shift+Space)** — level and upright lines to judge the page
+  against, described in their own section below. Most precise, usually fastest.
 * **Auto-deskew (D)** — projection-profile estimator over the text lines. Sweeps
   0.1° steps then refines at 0.01°, resolving to about ±0.01° on real text.
 * **The slider** — spans ±2.000° across its full width, so one screen pixel is
@@ -292,36 +468,38 @@ The angle box takes three decimals directly if you already know the number.
 
 ---
 
-## The alignment guide
+## Guides
 
-Press **L** and drag out a line. It stays on the canvas, thick and cyan, with a
-faint dashed extension running the width of the view — and then you turn the
-*page* onto *it*, with `[` and `]`, the nudge buttons, or the angle box.
+**Space** and **Shift+Space**, or the three buttons in the top bar, drop a cyan
+line across the middle of the view. Drag it to a baseline, a margin
+or a spine, and then turn the *page* onto *it* with `[` and `]`, the nudge
+buttons, or the angle box. **Clear** takes them all off.
 
-This is the reverse of the usual "draw a line and the page snaps to it", and the
-reason is that snapping gives you one shot: if the line was a hair off, so is
-the page, and you have nothing left on screen to check against. A straightedge
-that stays put is something you can judge against repeatedly, at any zoom, along
-its whole length.
+They are the same guides the spread aligner uses, which is the point: judging
+one page and judging two facing pages are the same task, and they used to be
+two different tools.
 
-* A guide drawn within 1.5° of level or plumb **snaps to exactly level or
-  plumb**, because a straightedge that is itself a fifth of a degree out is
-  worse than none. Hold **Alt** while drawing to keep a free angle — for
-  aligning to a diagonal.
-* **Shift** while drawing constrains to horizontal or vertical outright.
-* In cursor mode, drag the guide by its middle to move it, or by either end to
-  re-aim it.
-* It stays put when you change pages, so a whole document can be squared against
-  one reference.
-* **Ctrl+L** rotates the page so the guide's own slope becomes level — the old
-  behaviour, kept for when you traced the guide along something crooked rather
-  than laying it down as a reference. **Shift+L** clears the guide.
+* A guide appears in the middle of **what you are looking at**, not the middle
+  of the page — zoomed in on a headline, a guide placed at the page's centre
+  lands off screen and has to be hunted for. A second guide steps a little
+  clear of the first so it is not hidden underneath it.
+* Guides are level or upright by construction, so there is nothing to get
+  wrong about them. They stay put when you change pages, so a whole document
+  can be squared against one reference.
+* They belong to the page's coordinates, so they stay on the feature you put
+  them on as you pan and zoom.
 
-The guide belongs to the **editor window, not to the page**. It is a
-straightedge held against the screen: rotating, panning or zooming moves the
-page underneath while the guide stays exactly where you put it, holding both its
-position and its angle. A guide that drifted with the page could never converge
-with it.
+### What happened to the straightedge
+
+There used to be a free-angle straightedge (**L**) that you traced along a
+crooked feature, plus **Ctrl+L** to rotate the page onto it. Both are gone.
+
+The straightedge could be laid down at any angle, which meant it could be laid
+down *wrong* — and a reference line that is itself a fifth of a degree out
+aligns the page to its own error, invisibly. It tried to protect against that by
+snapping to level within 1.5°, at which point it was a level line with extra
+steps. A guide that is level by construction cannot be off, and the judgement it
+supports — does this baseline sit on this line — is the same one.
 
 ---
 
@@ -338,7 +516,7 @@ horizontally or vertically — one action, not one per line.
 What you get is *n* pages in the queue over the same source file, each with its
 own narrower crop. Nothing is written to disk and the source is never modified;
 a cut costs no space and undo puts it straight back. The pieces are **locked**
-against the project-wide crop, because a cut page is deliberately not the shape
+against a crop-all, because a cut page is deliberately not the shape
 of the rest of the document. Each keeps its own thumbnail, cropped to the piece,
 and its own name suffix (`scan_004 · left`) so the two halves are never confused
 in the queue or at export.
@@ -379,22 +557,13 @@ Every crop in the group is resized **about its own centre**, so the sizes change
 and the framing does not move. Locked pages (spreads, cut pieces, joined pages)
 sit out unless you tick them in, since they are meant to be a different shape.
 
----
-
-## Cropping
-
-Arm the crop tool and drag; afterwards, adjust with the handles in cursor mode.
-Arrow keys nudge by exactly 1 source pixel — Shift for 10, Alt to resize instead
-of move. The X/Y/W/H boxes are in full-resolution source pixels, and the Result
-panel shows the exact output size in pixels, inches and millimetres.
-
-**Fit to page edges (E)** finds the sheet against the scanner bed and pulls the
-crop just inside it. It deliberately trims a hair inside the paper edge, because
-a bounding box around a slightly skewed sheet always catches wedges of bed in
-the corners.
-
-If you rotate a page after cropping, the crop follows the content rather than
-staying put in frame coordinates.
+The changes are small by nature — that is the point of the tool — so the status
+bar says how many pages actually moved and by how much, rather than how many
+were in the group. "All 14 pages were already 4960×7016" and "12 of 14 pages
+resized — the largest change was 2 px" are different outcomes, and both used to
+report the same thing, which made a tool that was working look like one that
+was not. The pages that moved also drop their cached thumbnails, so the grid
+redraws them instead of showing the old framing until you happen to scroll.
 
 ---
 
@@ -447,8 +616,19 @@ ones that do say something easy to find.
   touched.*
 * **Sort button** — by file name (natural, so `page_2` sorts before `page_10`),
   by date modified, by size, or reverse the current order.
-* **Right-click** for document name, align as spread, move to top/bottom, reveal
-  in Explorer, and remove.
+* **Right-click** for document name, align as spread, **mark done / not done**,
+  move to top/bottom, reveal in Explorer, and remove.
+* **Enter** marks the selection done; **Ctrl+Enter** flips it either way. There
+  was no way to un-finish a page at all: Enter only ever set the mark, and
+  taking it back meant finding the page again and unticking a box in the
+  inspector, one page at a time — a box which, alone among the edits in the
+  app, undo could not reach either. Both are fixed.
+* **The divider between the grid and the canvas is ten pixels wide** and the
+  panels cannot be collapsed to nothing. Dragging that divider is the only way
+  to change the number of columns, and at the default four or five pixels it was
+  a game of patience. (`QSplitter.restoreState` carries the handle width with
+  it, so a session saved before this quietly put the thin one back — the width
+  is now re-applied after the restore.)
 
 Reordering works with a filter active too — it permutes the visible pages among
 the slots they already occupy and leaves hidden pages where they are.
@@ -503,7 +683,23 @@ Select a page and press **Ctrl+J**. If you only have one selected, a panel takes
 over the canvas telling you to click the facing page in the queue, with a Cancel
 button. Esc cancels too.
 
-It opens **in the main working area**, in place of the editing canvas, with the queue and the inspector still beside it — it used to be a floating window, which put the alignment somewhere other than where the work happens. Esc leaves it.
+It opens **in the main working area**, in place of the editing canvas, with the
+queue and the inspector still beside it — it used to be a floating window, which
+put the alignment somewhere other than where the work happens. Esc leaves it.
+
+While it is open, **every page but the two being aligned is greyed out and
+cannot be selected**, and the inspector is disabled. Both were live before, and
+both were traps: clicking a third page in the queue loaded it into the inspector
+while the aligner went on editing the original pair, so the panel on the right
+described a page that was not on screen and any adjustment made there landed on
+the wrong one.
+
+The queue also keeps its width. The aligner's control strip is a row of group
+boxes whose combined minimum width used to set the whole pane's minimum, which
+the splitter then took out of the page grid — squeezing it to a single column,
+and leaving it there after the aligner closed, saved into the next session. The
+strip now sits in a scroll area and asks for nothing, and the divider positions
+are restored on the way out.
 
 The two scans are butted together at the gutter so you see the spread as the
 reader would. Then:
@@ -514,7 +710,21 @@ reader would. Then:
 * **Add ―** drops a horizontal guide that runs across *both* pages. That's the
   tool that does the job: put a guide on a baseline on the left page and see
   where it lands on the right.
-* **Match Height / Width / Both**, and **Align tops**.
+* **Match Height / Width / Both**, and **Align tops** — one-shot, driven by the
+  active page.
+* **Link** keeps them matched. Both crop frames carry handles; drag either one
+  by an edge or a corner and the other follows. **Size only** — each page keeps
+  its own position over its own scan, because a spread is made consistent by
+  making the two pages the same shape, not by dragging one onto the other.
+  Switching the link on matches them straight away from the active page, rather
+  than waiting for the next drag and leaving the spread mismatched while
+  claiming to be joined up.
+
+  This is what a bound spread usually needs: the two halves were scanned
+  separately, the sheet sat differently on the glass each time, and the finished
+  pages still have to be the same size or the book reads as if it were assembled
+  from offcuts. The frames touch at the gutter, so their handles overlap there —
+  the active page gets first claim on its own edge.
 * **Show beyond crop** ghosts in the area outside each crop.
 
 "Keep alignment" writes each page's own crop and angle and records that the two
@@ -570,8 +780,22 @@ manual gets very large, so drop that number if you want something to email.
 
 **A zip of the exported pages** is produced by default, named
 `<document>-images.zip`, holding the image files flat with no folder structure
-and *not* the PDF. The loose files are kept as well; the zip is there so you
-have one thing to send.
+and *not* the PDF.
+
+**The individual page files are not kept, by default.** The project file already
+records every crop, angle and blur against the untouched scans, so the cropped
+pages are usually a step on the way to the zip or the PDF rather than the thing
+you wanted — and a set of 600 dpi TIFFs is several gigabytes to leave lying
+about for nothing to read. Tick **Keep the individual page files as well** when
+you do want them.
+
+The zip and the PDF are both assembled from files on disk, so this cannot mean
+"don't write them": the pages are written to a temporary folder inside the
+destination (same filesystem, so nothing is copied across devices), bundled, and
+then taken away. The export still reports every page it wrote, and the run reads
+identically either way. With neither the zip nor the PDF ticked the option is
+greyed out and the pages are kept regardless, because otherwise the export would
+produce nothing at all.
 
 Other options: TIFF compression (None / LZW / Deflate / Packbits / JPEG), bit
 depth, resolution (full, target DPI, or percent), and a JPEG preview beside each
@@ -593,8 +817,8 @@ Press **F1** in the app for this list.
 ```
 TOOLS
   V                   cursor - pan, zoom, adjust an existing crop or blur
-  C                   crop - draw ONE new crop, then it releases
-  L                   alignment guide - lay down a straightedge that stays put
+  C                   crop this page - one drag, then it releases
+  Shift+C             crop every page in the project - same, but for all
   B                   blur - drag out a blur over something on the page
   X                   cut - split this scan into separate pages
   Del                 delete the selected blur
@@ -603,15 +827,18 @@ TOOLS
 NAVIGATION
   Ctrl+←  Ctrl+→      previous / next page
   Enter               mark done and go to next
-  wheel               zoom at the cursor
-  middle-drag, Space  pan
-  F                   fit page          1 / 2   100% / 50%
+  Ctrl+Enter          mark done / not done - the inverse of Enter
+  wheel               scroll down the page
+  Shift+wheel         scroll across
+  Ctrl+wheel          zoom at the cursor
+  Ctrl++  Ctrl+-      zoom in / out
+  middle-drag         pan
+  F                   fit page
 
 STRAIGHTENING
   D                   auto-deskew from the text lines
   [  ]                rotate by 0.01°     Shift+[ ]   by 0.10°
-  Ctrl+L              rotate the page so the guide becomes level
-  Shift+L             clear the guide
+  Space  Shift+Space  drop a level / upright guide to judge the page against
 
 CUTTING AND JOINING
   X                   place a cut line - Shift cuts across instead of down
@@ -652,7 +879,7 @@ scanforge/
   geometry.py      rotation maths and the coordinate spaces - the contract
                    the preview and the exporter both obey
   model.py         PageEdit / Project, the non-destructive edit record,
-                   crop linking, blur regions, cutting and joining,
+                   crop propagation, blur regions, cutting and joining,
                    size grouping, reordering and sorting
   history.py       undo/redo by whole-project snapshot
   imageio_util.py  TIFF read/write preserving bit depth, channels, DPI, ICC
@@ -665,7 +892,7 @@ scanforge/
     icons.py       every icon and the app mark, drawn from code - no assets
     loader.py      background decoding and one-off worker tasks, so nothing
                    blocks the interface
-    canvas.py      the editing canvas, the tools, the alignment guide
+    canvas.py      the editing canvas, the tools, the guides
     inspector.py   the right-hand controls
     queue_panel.py the page list
     spread_view.py facing-page alignment, in the work area

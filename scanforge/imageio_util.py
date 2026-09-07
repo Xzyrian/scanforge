@@ -101,6 +101,14 @@ def read_array(path: str, threads: int = 1) -> np.ndarray:
 
 
 def _sanitise(arr: np.ndarray) -> np.ndarray:
+    # A TIFF written with planarconfig=separate stores each colour as its own
+    # plane, and comes back as (samples, height, width).  Left alone, the three
+    # planes are read as three rows of pixels: a 3000-row scan becomes a proxy
+    # one pixel tall.  Scanner software that writes separate planes is
+    # uncommon but it exists, and the failure is silent.
+    if (arr.ndim == 3 and arr.shape[0] in (3, 4)
+            and arr.shape[0] < arr.shape[1] and arr.shape[0] < arr.shape[2]):
+        arr = np.moveaxis(arr, 0, -1)
     if arr.ndim == 3 and arr.shape[2] == 1:
         arr = arr[:, :, 0]
     if arr.ndim == 3 and arr.shape[2] > 4:

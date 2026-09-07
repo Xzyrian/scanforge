@@ -276,6 +276,65 @@ def _rot_ccw(p, c):
     p.restore()
 
 
+def _crop_all(p, c):
+    """The crop marks over a stack of pages: one rectangle, many sheets."""
+    _stroke(p, c, 1.3)
+    p.drawRect(QRectF(3.0, 3.0, 14.0, 14.0))
+    p.drawRect(QRectF(5.5, 5.5, 14.0, 14.0))
+    _stroke(p, QColor(ACCENT), 2.0)
+    p.drawPolyline(_poly((8.5, 3.0), (8.5, 16.5), (21.0, 16.5)))
+    p.drawPolyline(_poly((3.0, 9.5), (16.5, 9.5), (16.5, 21.5)))
+
+
+def _flip_h(p, c):
+    """A page mirrored about an upright axis: solid one side, outline the other."""
+    p.setPen(Qt.NoPen)
+    p.setBrush(c)
+    p.drawPolygon(_poly((10.6, 4.5), (10.6, 19.5), (3.5, 19.5), (3.5, 4.5)))
+    _stroke(p, c, 1.6)
+    p.drawPolyline(_poly((13.4, 4.5), (20.5, 4.5), (20.5, 19.5), (13.4, 19.5),
+                         (13.4, 4.5)))
+    _stroke(p, QColor(ACCENT), 1.8)
+    p.drawLine(QPointF(12.0, 2.5), QPointF(12.0, 21.5))
+
+
+def _flip_v(p, c):
+    p.save()
+    p.translate(12, 12)
+    p.rotate(90)
+    p.translate(-12, -12)
+    _flip_h(p, c)
+    p.restore()
+
+
+def _guide_h(p, c):
+    """A level line laid across a page."""
+    _stroke(p, c, 1.6)
+    p.drawRect(QRectF(4.5, 4.5, 15, 15))
+    _stroke(p, QColor(ACCENT), 2.2)
+    p.drawLine(QPointF(2.0, 12.0), QPointF(22.0, 12.0))
+
+
+def _guide_v(p, c):
+    p.save()
+    p.translate(12, 12)
+    p.rotate(90)
+    p.translate(-12, -12)
+    _guide_h(p, c)
+    p.restore()
+
+
+def _guide_clear(p, c):
+    """Both guides, struck through."""
+    _stroke(p, c, 1.6)
+    p.drawRect(QRectF(4.5, 4.5, 15, 15))
+    _stroke(p, c, 1.4)
+    p.drawLine(QPointF(2.5, 12.0), QPointF(21.5, 12.0))
+    p.drawLine(QPointF(12.0, 2.5), QPointF(12.0, 21.5))
+    _stroke(p, QColor(ACCENT), 2.2)
+    p.drawLine(QPointF(5.5, 18.5), QPointF(18.5, 5.5))
+
+
 def _blur(p, c):
     """A rectangle whose right half dissolves into dots."""
     _stroke(p, c, 1.8)
@@ -380,6 +439,8 @@ _DRAW = {
     "auto": _auto, "copyframe": _copyframe, "spread": _spread,
     "fitview": _fitview, "one2one": _one2one, "done": _done, "trash": _trash,
     "up": _up, "down": _down, "sort": _sort, "rot_cw": _rot_cw,
+    "flip_h": _flip_h, "flip_v": _flip_v, "crop_all": _crop_all,
+    "guide_h": _guide_h, "guide_v": _guide_v, "guide_clear": _guide_clear,
     "rot_ccw": _rot_ccw, "link": _link, "goto": _goto, "blur": _blur,
 }
 

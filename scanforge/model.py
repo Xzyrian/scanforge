@@ -105,8 +105,8 @@ class PageEdit:
     done: bool = False
     note: str = ""
 
-    # How this page relates to the project-wide crop:
-    #   "linked"       - takes the shared crop entirely (the default)
+    # What "crop all pages" does to this page:
+    #   "linked"       - takes the whole rectangle (the default)
     #   "own_position" - keeps its own x/y, takes the shared width and height,
     #                    for a sheet that sat differently on the glass
     #   "locked"       - never touched by propagation, in either direction.
@@ -155,7 +155,7 @@ class PageEdit:
         `axis` "v" means a vertical cut line, i.e. the page divides left/right.
         `fractions` are positions along that axis within the current crop, as
         values in (0, 1).  Each piece is a new page over the same source with a
-        narrower crop, and is locked so the project-wide crop leaves it alone -
+        narrower crop, and is locked so a crop-all leaves it alone -
         the whole point of a cut page is that it is *not* the same shape as the
         rest of the document.
         """
@@ -249,7 +249,7 @@ class PageEdit:
                    channels=max(p.channels for p in parts),
                    dtype=first.dtype, join=join)
         # A joined page is not the shape of the rest of the document, so the
-        # shared crop must leave it alone.
+        # a crop-all must leave it alone.
         page.crop_mode = "locked"
         page.label = "joined"
         return page
@@ -285,7 +285,6 @@ class Project:
     last_folder: str = ""
     # a scanned document is one object photographed many times; by default
     # every page therefore gets the same crop, and so the same output size
-    link_crop: bool = True
     # one name for the whole set - these are pages of a single brochure or
     # manual, not a folder of unrelated documents.  Set at export time.
     document_name: str = ""
@@ -306,20 +305,24 @@ class Project:
     def paths(self) -> set:
         return {os.path.normcase(os.path.abspath(p.path)) for p in self.pages}
 
-    # ------------------------------------------------------------ crop linking
-    def apply_linked_crop(self, source: PageEdit) -> int:
+    # -------------------------------------------------------- crop to all
+    def apply_crop_to_all(self, source: PageEdit) -> int:
         """Push `source`'s crop onto every other page.
 
-        A "locked" page is skipped in both directions - it neither receives the
-        shared crop nor pushes its own onto anyone.  That exemption is what
-        stops a spread alignment from being silently destroyed the next time
-        you nudge the crop on some unrelated page.
+        Called only when you ask for it, by name: this used to run after every
+        crop edit while a project-wide "link" was switched on, which meant a
+        careful nudge on one page was silently copied over all the others.  Now
+        it is what the "crop all pages" tool does and nothing else.
 
-        An "own_position" page keeps its x/y but still takes the shared width
-        and height, because "every page the same size" is the promise that
-        should not break.
+        A "locked" page is skipped in both directions - it neither receives the
+        crop nor pushes its own onto anyone.  That exemption is what stops a
+        spread alignment from being destroyed by a crop somewhere else.
+
+        An "own_position" page keeps its x/y but still takes the width and
+        height, because "every page the same size" is the promise that should
+        not break.
         """
-        if not self.link_crop or source.crop is None:
+        if source.crop is None:
             return 0
         if source.crop_mode == "locked":
             return 0
@@ -418,7 +421,7 @@ class Project:
         return n
 
     def uniform_size(self) -> Optional[tuple]:
-        """The one output size among the pages that follow the shared crop.
+        """The one output size among the pages that a crop-all reaches.
 
         Locked pages are excluded on purpose: a spread-aligned pair is meant to
         differ, so counting it would make the queue permanently report "sizes
@@ -522,7 +525,6 @@ class Project:
         self.export_dir = ""
         self.last_folder = ""
         self.document_name = ""
-        self.link_crop = True
 
     # ------------------------------------------------------------------- I/O
     def save(self, path: str) -> None:
@@ -530,7 +532,6 @@ class Project:
             "schema": SCHEMA_VERSION,
             "export_dir": self.export_dir,
             "last_folder": self.last_folder,
-            "link_crop": self.link_crop,
             "document_name": self.document_name,
             "pages": [p.to_dict() for p in self.pages],
         }
@@ -547,7 +548,9 @@ class Project:
         proj = cls(path=path)
         proj.export_dir = data.get("export_dir", "")
         proj.last_folder = data.get("last_folder", "")
-        proj.link_crop = bool(data.get("link_crop", True))
+        # `link_crop` used to live here: a project-wide switch that copied
+        # every crop edit onto every page.  Two crop tools replaced it, so the
+        # key is read from older project files and discarded.
         proj.document_name = data.get("document_name", "")
         if not proj.document_name:
             # projects from before the name became project-wide kept it per page

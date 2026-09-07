@@ -35,6 +35,23 @@ DETAIL = 5200     # swapped in when you zoom past ~40%
 
 _TIERS = {"thumb": THUMB, "proxy": PROXY, "detail": DETAIL}
 
+# How much of the progress bar the decode owns.  The rest belongs to shrinking
+# and writing the tiers, which is a real part of the wait - half a second a page
+# for three tiers of JPEG - and used to happen with the bar sitting on 100%.
+_DECODE_SHARE = 0.88
+
+# Why the last decode took the path it did.  Kept for the diagnostic in
+# `tools/decode_report.py`; nothing in the app reads it.
+last_strategy: dict = {}
+
+
+def _note(path: str, strategy: str, detail: str = "") -> None:
+    last_strategy[os.path.basename(path)] = (strategy, detail)
+    if os.environ.get("SCANFORGE_DEBUG"):
+        import sys
+        print(f"[proxycache] {os.path.basename(path)}: {strategy}"
+              + (f" ({detail})" if detail else ""), file=sys.stderr)
+
 
 def cache_root() -> str:
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/.cache")
@@ -64,23 +81,9 @@ def _meta_file(path: str) -> str:
 # downsampling
 # --------------------------------------------------------------------------
 
-def _incremental(path: str, long_edge: int, on_progress=None) -> Optional[np.ndarray]:
-    """Decode a TIFF tile by tile, shrinking each one as it arrives.
-
-    Two things fall out of this that the obvious "decode it all, then resize"
-    cannot give.  The first is a real percentage: a 140 MP scan is a few hundred
-    tiles, so there is something honest to report several times a second, rather
-    than an animation that only means "still working".  The second is that the
-    full-size array is never built at all - each tile is reduced and added to
-    the small one, then dropped.
-
-    Measured on a 140 MP Deflate scan: 2.3 s and 637 MB peak, against 3.5 s and
-    964 MB for decoding the whole thing and resizing afterwards.  Less memory
-    traffic turns out to be faster as well as smaller.
-
-    Returns None for anything unusual - an odd dtype, planar storage, a format
-    that is not TIFF - and the caller falls back to the plain path.
-    """
+def _layout(path: str) -> Optional[dict]:
+    """What the TIFF is made of, in one open, or None if it is not one we can
+    walk segment by segment."""
     if iio.tifffile is None or cv2 is None:
         return None
     if not path.lower().endswith((".tif", ".tiff")):
@@ -99,65 +102,190 @@ def _incremental(path: str, long_edge: int, on_progress=None) -> Optional[np.nda
                 return None
             if int(getattr(page, "planarconfig", 1) or 1) != 1:
                 return None
-            chunks = getattr(page, "chunks", None)
-            if not chunks:
+            if not getattr(page, "chunks", None):
                 return None
-
-            scale = long_edge / float(max(W, H))
-            if scale >= 1.0:
-                return None                  # already small; nothing to gain
-            oh = max(1, int(round(H * scale)))
-            ow = max(1, int(round(W * scale)))
-
-            acc = np.zeros((oh, ow, C), np.float32)
-            wgt = np.zeros((oh, ow, 1), np.float32)
-            total = max(1, len(getattr(page, "dataoffsets", ()) or ()) or 1)
-            step = max(1, total // 60)       # ~60 reports per page is plenty
-
-            for n, seg in enumerate(page.segments(), 1):
-                data, index, sshape = seg
-                if on_progress is not None and (n % step == 0 or n == total):
-                    on_progress(min(1.0, n / total))
-                if data is None:
-                    continue
-                y0, x0 = int(index[2]), int(index[3])
-                if y0 >= H or x0 >= W:
-                    continue
-                blk = np.asarray(data)
-                blk = blk.reshape(sshape)
-                while blk.ndim > 3:
-                    blk = blk[0]
-                if blk.ndim == 2:
-                    blk = blk[:, :, None]
-                bh = min(blk.shape[0], H - y0)
-                bw = min(blk.shape[1], W - x0)
-                blk = blk[:bh, :bw]
-
-                dy0, dx0 = int(y0 * scale), int(x0 * scale)
-                dy1 = min(oh, max(dy0 + 1, int(round((y0 + bh) * scale))))
-                dx1 = min(ow, max(dx0 + 1, int(round((x0 + bw) * scale))))
-                if dy1 <= dy0 or dx1 <= dx0:
-                    continue
-                small = cv2.resize(blk, (dx1 - dx0, dy1 - dy0),
-                                   interpolation=cv2.INTER_AREA)
-                if small.ndim == 2:
-                    small = small[:, :, None]
-                acc[dy0:dy1, dx0:dx1] += small.astype(np.float32)
-                wgt[dy0:dy1, dx0:dx1] += 1.0
-
-            out = acc / np.maximum(wgt, 1e-6)
-            if page.dtype == np.uint16:
-                out = out / 257.0
-            out = np.clip(out, 0, 255).astype(np.uint8)
-            if C == 1:
-                out = out[:, :, 0]
-            elif C == 4:
-                out = out[:, :, :3]
-            if on_progress is not None:
-                on_progress(1.0)
-            return np.ascontiguousarray(out)
-    except Exception:
+            try:
+                comp = int(page.compression)
+            except Exception:                            # noqa: BLE001
+                comp = 0
+            return {"H": H, "W": W, "C": C, "dtype": page.dtype,
+                    "segments": max(1, len(getattr(page, "dataoffsets", ()) or ())),
+                    "stored": H * W * C * int(page.dtype.itemsize),
+                    "raw": comp == 1}
+    except Exception:                                    # noqa: BLE001
         return None
+
+
+def _plan(path: str, long_edge: int, layout: Optional[dict]) -> str:
+    """Which of the three decodes to use for this file.
+
+    They are not interchangeable, and picking the wrong one is what made
+    importing feel slower than it needed to.  Measured on a 108 MP page, warm
+    cache, best of three:
+
+        layout          accumulate      paste       whole
+        tiled Deflate     0.97 s       0.65 s      0.66 s     312 / 566 / 565 MB
+        striped Deflate   0.83 s       0.57 s      0.59 s     311 / 565 / 563 MB
+        striped LZW       2.52 s       3.10 s      2.51 s     398 / 650 / 648 MB
+        uncompressed      0.89 s       0.53 s      0.21 s     686 / 890 / 397 MB
+
+    So: an uncompressed TIFF is read whole, because tifffile maps it straight
+    off the disk - four times faster *and* smaller than walking it.  Anything
+    compressed is walked segment by segment, which is what makes an honest
+    percentage possible; whether each segment is pasted into a full-size array
+    (fast) or averaged into the small one (about 45% less memory, about 40%
+    slower) depends on whether the machine has the room to spare.
+    """
+    forced = os.environ.get("SCANFORGE_DECODE", "").strip().lower()
+    if forced in ("whole", "paste", "accumulate"):
+        return "whole" if layout is None else forced
+    if layout is None:
+        return "whole"
+    if long_edge >= max(layout["W"], layout["H"]):
+        return "whole"                        # already small; nothing to gain
+    if layout["raw"]:
+        return "whole"
+    # Pasting is worth roughly 30% of the decode and costs an extra full-size
+    # array - 320 MB for a 140 MP page, times however many decodes the gate is
+    # letting through.  That is a good trade with memory to spare and a bad one
+    # without, so the bar is set high: the array itself, the resize's working
+    # copy, and room for the other decodes in flight, with headroom left over.
+    return ("paste" if available_memory() > layout["stored"] * 3.5
+            else "accumulate")
+
+
+def _walk(path: str, long_edge: int, layout: dict, mode: str,
+          on_progress=None) -> np.ndarray:
+    """Decode a TIFF segment by segment and return it reduced to `long_edge`.
+
+    Walking the file is what gives a real percentage: a 140 MP scan is a few
+    hundred segments, so there is something honest to report several times a
+    second rather than an animation that only means "still working".
+
+    `mode` decides what happens to each segment as it arrives.  "paste" writes
+    it into a full-size array and resizes once at the end.  "accumulate"
+    reduces each segment on arrival and averages it into the small array, so
+    the full-size array is never built at all.
+    """
+    H, W, C = layout["H"], layout["W"], layout["C"]
+    scale = long_edge / float(max(W, H))
+    oh, ow = max(1, int(round(H * scale))), max(1, int(round(W * scale)))
+    total = layout["segments"]
+    step = max(1, total // 60)                # ~60 reports per page is plenty
+
+    if mode == "paste":
+        full = np.empty((H, W, C), layout["dtype"])
+    else:
+        acc = np.zeros((oh, ow, C), np.float32)
+        wgt = np.zeros((oh, ow, 1), np.float32)
+
+    with iio.tifffile.TiffFile(path) as tf:
+        page = tf.pages[0]
+        for n, (data, index, sshape) in enumerate(page.segments(), 1):
+            if on_progress is not None and (n % step == 0 or n == total):
+                on_progress(min(1.0, n / total))
+            if data is None:
+                continue
+            y0, x0 = int(index[2]), int(index[3])
+            if y0 >= H or x0 >= W:
+                continue
+            blk = np.asarray(data).reshape(sshape)
+            while blk.ndim > 3:
+                blk = blk[0]
+            if blk.ndim == 2:
+                blk = blk[:, :, None]
+            bh = min(blk.shape[0], H - y0)
+            bw = min(blk.shape[1], W - x0)
+            blk = blk[:bh, :bw]
+
+            if mode == "paste":
+                full[y0:y0 + bh, x0:x0 + bw] = blk
+                continue
+
+            dy0, dx0 = int(y0 * scale), int(x0 * scale)
+            dy1 = min(oh, max(dy0 + 1, int(round((y0 + bh) * scale))))
+            dx1 = min(ow, max(dx0 + 1, int(round((x0 + bw) * scale))))
+            if dy1 <= dy0 or dx1 <= dx0:
+                continue
+            small = cv2.resize(blk, (dx1 - dx0, dy1 - dy0),
+                               interpolation=cv2.INTER_AREA)
+            if small.ndim == 2:
+                small = small[:, :, None]
+            acc[dy0:dy1, dx0:dx1] += small.astype(np.float32)
+            wgt[dy0:dy1, dx0:dx1] += 1.0
+
+    if mode == "paste":
+        if C == 1:
+            full = full[:, :, 0]
+        elif C == 4:
+            full = full[:, :, :3]
+        return _shrink(full, long_edge)
+
+    out = acc / np.maximum(wgt, 1e-6)
+    if layout["dtype"] == np.uint16:
+        out = out / 257.0
+    out = np.clip(out, 0, 255).astype(np.uint8)
+    if C == 1:
+        out = out[:, :, 0]
+    elif C == 4:
+        out = out[:, :, :3]
+    return np.ascontiguousarray(out)
+
+
+def _decode(path: str, long_edge: int, on_progress=None) -> np.ndarray:
+    """Get `path` down to `long_edge`, by whichever route suits the file.
+
+    Every route ends in an array no larger than `long_edge`, so the caller can
+    shrink the smaller tiers out of it without going back to the source.
+
+    A failure part-way through a walk is not silently retried as if nothing had
+    happened: it is recorded, and running out of memory in particular falls to
+    the *smaller* decode rather than the whole-file one, which is the mistake
+    that turns a tight machine into a stalled one.
+    """
+    layout = _layout(path)
+    plan = _plan(path, long_edge, layout)
+
+    if plan != "whole":
+        try:
+            out = _walk(path, long_edge, layout, plan, on_progress)
+            _note(path, plan, f"{layout['segments']} segments")
+            return out
+        except MemoryError:
+            # the answer to running out of room is never "now read the whole
+            # file into memory instead"
+            set_decode_limit(1)
+            time.sleep(0.5)
+            try:
+                out = _walk(path, long_edge, layout, "accumulate", on_progress)
+                _note(path, "accumulate", "after running short of memory")
+                return out
+            except Exception as exc:                     # noqa: BLE001
+                _note(path, "whole", f"walk failed twice: {exc}")
+        except Exception as exc:                         # noqa: BLE001
+            _note(path, "whole", f"walk failed: {exc}")
+
+    if on_progress is not None:
+        on_progress(0.02)
+    try:
+        arr = iio.read_array(path)
+    except MemoryError:
+        # Running out of memory mid-import used to take the whole application
+        # with it.  Drop to one decode at a time, let whatever else is in
+        # flight finish and release its buffers, and try again: slow beats
+        # dead.
+        set_decode_limit(1)
+        time.sleep(1.0)
+        arr = iio.read_array(path)
+    if plan == "whole" and layout is not None:
+        _note(path, "whole", "raw" if layout["raw"] else "already small")
+    elif plan == "whole":
+        _note(path, "whole", "not a walkable TIFF")
+    out = _shrink(arr, long_edge)
+    del arr
+    if on_progress is not None:
+        on_progress(1.0)
+    return out
 
 
 def _shrink(arr: np.ndarray, long_edge: int) -> np.ndarray:
@@ -317,27 +445,27 @@ def build(path: str, tiers=("thumb", "proxy"), force: bool = False,
     if need:
         need = list(effective_tiers(path, tiers, force)) or need
         biggest = max(_TIERS[t] for t in need)
+        # The decode owns most of the bar and the tier writing owns the rest,
+        # so nothing happens behind a bar that is already full.
+        def decode_progress(f):
+            if on_progress is not None:
+                on_progress(max(0.0, min(1.0, f)) * _DECODE_SHARE)
+
         with _gate:
             arr = _read_reduced(path, biggest)
-            if arr is None:
-                # tile by tile where we can: it is faster, uses a third less
-                # memory, and is the only way to report a real percentage
-                arr = _incremental(path, biggest, on_progress)
-            if arr is None:
-                try:
-                    arr = iio.read_array(path)
-                except MemoryError:
-                    # Running out of memory mid-import used to take the whole
-                    # application with it.  Drop to one decode at a time, let
-                    # whatever else is in flight finish and release its buffers,
-                    # and try this one again: slow beats dead.
-                    set_decode_limit(1)
-                    time.sleep(1.0)
-                    arr = iio.read_array(path)
+            if arr is not None:
+                _note(path, "pyramid", "embedded reduced level")
+                arr = _shrink(arr, biggest)
+                if on_progress is not None:
+                    on_progress(_DECODE_SHARE)
+            else:
+                arr = _decode(path, biggest,
+                              decode_progress if on_progress else None)
             # Shrink first, convert to 8-bit after.  A 16-bit 140 MP scan
             # converted up front costs a second full-size array - 420 MB - for
             # pixels that are about to be thrown away anyway.
-            for tier in sorted(need, key=lambda t: -_TIERS[t]):
+            order = sorted(need, key=lambda t: -_TIERS[t])
+            for done, tier in enumerate(order, 1):
                 small = _shrink(arr, _TIERS[tier])
                 im = iio.to_pil(small)
                 if im.mode not in ("RGB", "L"):
@@ -366,6 +494,9 @@ def build(path: str, tiers=("thumb", "proxy"), force: bool = False,
                     raise
                 if _TIERS[tier] >= 1000 and small is not arr:
                     arr = small       # smaller tiers shrink from this one
+                if on_progress is not None:
+                    on_progress(_DECODE_SHARE
+                                + (1.0 - _DECODE_SHARE) * done / len(order))
             del arr
 
     try:

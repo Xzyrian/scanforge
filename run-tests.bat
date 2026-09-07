@@ -13,4 +13,7 @@ echo Pipeline tests ^(builds a synthetic 10000x14000 scan; takes a couple of min
 echo.
 echo UI tests
 ".venv\Scripts\python.exe" tests\test_ui.py
+echo.
+echo Self-test ^(the same checks build-exe.bat runs against the built .exe^)
+".venv\Scripts\python.exe" tools\freeze_check.py
 pause

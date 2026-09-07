@@ -9,9 +9,11 @@ from typing import Optional
 import numpy as np
 from PySide6.QtCore import QObject, QSettings, QSize, QTimer, Qt, Signal
 from PySide6.QtGui import QAction, QActionGroup, QColor, QKeySequence, QPalette
-from PySide6.QtWidgets import (QApplication, QFileDialog, QLabel, QMainWindow,
-                               QMessageBox, QSplitter, QStackedWidget,
-                               QStatusBar, QToolBar, QWidget)
+from PySide6.QtWidgets import (QApplication, QFileDialog, QFrame, QGridLayout,
+                               QHBoxLayout, QLabel, QMainWindow, QMessageBox,
+                               QScrollArea, QSlider, QSplitter, QStackedWidget,
+                               QStatusBar, QToolBar, QToolButton, QVBoxLayout,
+                               QWidget)
 
 from .. import autodetect, imageio_util as iio, proxycache, render as rnd
 from ..export import BatchExporter, ExportSettings
@@ -20,6 +22,7 @@ from ..history import History
 from .. import model as mdl
 from ..model import PageEdit, Project
 from . import icons
+from .angle_strip import AngleStrip
 from .canvas import Canvas, Tool
 from .export_dialog import ExportDialog, ProgressDialog
 from .inspector import Inspector
@@ -73,6 +76,58 @@ QToolButton:disabled { }
 """
 
 
+class ToolColumn(QWidget):
+    """The editing tools, two abreast, in a column beside the canvas.
+
+    A QToolBar can only be one button wide when it stands on end, and sixteen
+    tools in a single file is taller than most windows.  Two columns with a
+    rule between each group fits them all without scrolling and keeps the
+    grouping legible - which a horizontal bar could only express with a
+    separator you have to squint at.
+
+    `actions()` returns them in order, separators included as their own
+    entries, so the layout can be asserted rather than eyeballed.
+    """
+
+    def __init__(self, groups: list, icon_px: int, parent=None):
+        super().__init__(parent)
+        grid = QGridLayout(self)
+        grid.setContentsMargins(5, 7, 5, 7)
+        grid.setSpacing(3)
+        row = 0
+        for gi, group in enumerate(groups):
+            if gi:
+                # The rule earns its keep only if the eye finds it: a hairline
+                # the colour of the background separates nothing.  Given room
+                # above and below, it reads as a break rather than as another
+                # row of buttons.
+                holder = QWidget()
+                hl = QHBoxLayout(holder)
+                hl.setContentsMargins(2, 5, 2, 5)
+                rule = QFrame()
+                rule.setFrameShape(QFrame.HLine)
+                rule.setFrameShadow(QFrame.Plain)
+                rule.setStyleSheet("background:#4c515a;border:none;")
+                rule.setFixedHeight(1)
+                hl.addWidget(rule)
+                grid.addWidget(holder, row, 0, 1, 2)
+                sep = QAction(self)
+                sep.setSeparator(True)
+                self.addAction(sep)
+                row += 1
+            for i, act in enumerate(group):
+                b = QToolButton(self)
+                b.setDefaultAction(act)
+                b.setIconSize(QSize(icon_px, icon_px))
+                b.setAutoRaise(True)
+                b.setFixedSize(icon_px + 12, icon_px + 10)
+                grid.addWidget(b, row + i // 2, i % 2)
+                self.addAction(act)
+            row += (len(group) + 1) // 2
+        grid.setRowStretch(row, 1)
+        self.setFixedWidth(2 * (icon_px + 12) + 3 + 8)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -99,8 +154,6 @@ class MainWindow(QMainWindow):
         self._detail_loaded = False
         self._dirty = False
         self._spread_pick: Optional[str] = None
-        self._first_crop_pending = True
-        self._first_crop_armed = False
 
         # -------------------------------------------------------- widgets
         self.canvas = Canvas(self)
@@ -114,16 +167,76 @@ class MainWindow(QMainWindow):
         self.center = QStackedWidget()
         self.center.addWidget(self.canvas)
 
+        # Tools, then the page you are working on, then the pages you are
+        # working through: left to right in the order the work flows.  The
+        # tools act on the page in front of you, so they sit beside it; a bar
+        # across the top of the window put the crop tool as far from the crop
+        # as the layout allows, and that is a trip your eye makes on every page
+        # of a two-hundred-page manual.  The column itself is built after the
+        # actions exist, in _build_toolbars(), and inserted at index 0.
+        #
+        # The canvas carries the straightening strip beneath it: a slider, the
+        # number, and a way back to zero, directly under the page they turn.
+        self.angle_strip = AngleStrip()
+        self.angle_strip.setStyleSheet(
+            "background:#24262b;border-top:1px solid #34373d;")
+        self.editing = QWidget()
+        ev = QVBoxLayout(self.editing)
+        ev.setContentsMargins(0, 0, 0, 0)
+        ev.setSpacing(0)
+        ev.addWidget(self.center, 1)
+        ev.addWidget(self.angle_strip)
+
+        # The right-hand column is the page grid.  Under it, for now, is what
+        # is left of the old inspector: crop numbers, blur and the reuse
+        # buttons, none of which have been given a home yet.  It is a holding
+        # position, not a design - the divider between them can be dragged
+        # shut, and the panel goes when its contents are placed.
+        # In a scroll area, so its full height is never something the splitter
+        # has to honour: left to ask for what its layout wants, the panel took
+        # the column and left the grid a strip shorter than one row of pages.
+        self.inspector_scroll = QScrollArea()
+        self.inspector_scroll.setWidget(self.inspector)
+        self.inspector_scroll.setWidgetResizable(True)
+        self.inspector_scroll.setFrameShape(QScrollArea.NoFrame)
+        self.inspector_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.inspector_scroll.setMinimumHeight(120)
+
+        self.right_col = QSplitter(Qt.Vertical)
+        self.right_col.addWidget(self.queue)
+        self.right_col.addWidget(self.inspector_scroll)
+        self.right_col.setStretchFactor(0, 1)
+        self.right_col.setStretchFactor(1, 0)
+        self.right_col.setHandleWidth(10)
+        self.right_col.setChildrenCollapsible(False)
+        # the grid is what this column is for: it keeps at least two rows of
+        # pages whatever the panel below it would like
+        self.queue.setMinimumHeight(340)
+
         split = QSplitter(Qt.Horizontal)
-        split.addWidget(self.queue)
-        split.addWidget(self.center)
-        split.addWidget(self.inspector)
-        split.setStretchFactor(0, 0)
-        split.setStretchFactor(1, 1)
-        split.setStretchFactor(2, 0)
-        split.setSizes([300, 1000, 340])
+        split.addWidget(self.editing)
+        split.addWidget(self.right_col)
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 0)
+        split.setSizes([1000, 320])
+        # The default handle is about five pixels wide, and the grid's column
+        # snapping is only reachable by dragging it - a target that thin makes
+        # the one gesture that resizes the grid a game of patience.
+        split.setHandleWidth(10)
+        split.setChildrenCollapsible(False)
+
+        # The tool column is fixed width, so it sits outside the splitter: a
+        # divider beside something that cannot be resized is a control that
+        # does nothing.
+        self.work = QWidget()
+        wl = QHBoxLayout(self.work)
+        wl.setContentsMargins(0, 0, 0, 0)
+        wl.setSpacing(0)
+        self.work_layout = wl
+        wl.addWidget(split, 1)
+
         split.splitterMoved.connect(self._snap_queue_width)
-        self.setCentralWidget(split)
+        self.setCentralWidget(self.work)
         self.splitter = split
 
         # a panel that floats over the canvas for waits and for modes that
@@ -227,9 +340,6 @@ class MainWindow(QMainWindow):
                                  app_shortcut=True)
 
         # ---- edit
-        self.a_deskew = self._act("&Auto-deskew page", self.auto_deskew, "D",
-                                  "Estimate the skew from the text lines",
-                                  icon="deskew")
         self.a_fitpage = self._act("Fit crop to page &edges", self.fit_to_page, "E",
                                    "Detect the sheet and crop to it", icon="fitpage")
         self.a_auto_both = self._act("Auto straighten && crop", self.auto_both, "A",
@@ -246,31 +356,35 @@ class MainWindow(QMainWindow):
                                    "Ctrl+G",
                                    "One name for the whole set, used for every "
                                    "exported file")
-        self.a_link = self._act("Same crop for &every page", self.toggle_link,
-                                tip="Keep one crop across the whole project so "
-                                    "every exported page is identical in size",
-                                checkable=True, icon="link")
-        self.a_link.setChecked(True)
 
         # ---- view
         self.a_fit = self._act("&Fit page", self.canvas.fit, "F", "Fit page",
                                icon="fitview")
-        self.a_100 = self._act("&100%  (actual pixels)", lambda: self.canvas.zoom_to(1.0),
-                               "1", "Zoom to actual pixels", icon="one2one")
-        self.a_50 = self._act("50%", lambda: self.canvas.zoom_to(0.5), "2")
-        self.a_zoomin = self._act("Zoom in", lambda: self.canvas.zoom_by(1.25), "Ctrl+=")
-        self.a_zoomout = self._act("Zoom out", lambda: self.canvas.zoom_by(0.8), "Ctrl+-")
+        # No 100% or 50%: everything you look at is a 2200 px interpretation of
+        # a 10000 px scan, so "actual pixels" names a thing the editor never
+        # shows you.  The slider in the status bar is the zoom control.
+        self.a_zoomin = self._act("Zoom in", lambda: self.canvas.zoom_by(1.25))
+        self.a_zoomout = self._act("Zoom out", lambda: self.canvas.zoom_by(0.8))
+        # Ctrl+= is what the key actually sends on most layouts; Ctrl++ is what
+        # it says on the keycap, so both are bound and the keycap is what the
+        # menu shows.
+        self.a_zoomin.setShortcuts([QKeySequence("Ctrl++"), QKeySequence("Ctrl+=")])
+        self.a_zoomout.setShortcut(QKeySequence("Ctrl+-"))
         self.a_grid = self._act("Show &grid", self.toggle_grid, "G", "Show grid",
                                 checkable=True, icon="grid")
-        self.a_thirds = self._act("Show &thirds", self.toggle_thirds, checkable=True)
-        self.a_thirds.setChecked(True)
         self.a_dim = self._act("&Dim outside crop", self.toggle_dim, checkable=True)
         self.a_dim.setChecked(True)
         self.a_guide_h = self._act("Add &horizontal guide",
-                                   lambda: self.canvas.add_guide(True), "H")
+                                   lambda: self._add_guide(True), "Space",
+                                   "A level line to judge a baseline against",
+                                   icon="guide_h")
         self.a_guide_v = self._act("Add &vertical guide",
-                                   lambda: self.canvas.add_guide(False), "Shift+H")
-        self.a_guide_clear = self._act("Clear guides", self.canvas.clear_guides)
+                                   lambda: self._add_guide(False), "Shift+Space",
+                                   "An upright line to judge a margin against",
+                                   icon="guide_v")
+        self.a_guide_clear = self._act("Clear guides", self._clear_guides,
+                                       tip="Take every guide off the page",
+                                       icon="guide_clear")
 
         # ---- page
         self.a_next = self._act("&Next page", lambda: self.step(1), "Ctrl+Right")
@@ -278,6 +392,21 @@ class MainWindow(QMainWindow):
         self.a_done_next = self._act("Mark &done and go to next", self.done_and_next,
                                      "Return", "Mark done and go to next",
                                      icon="done")
+        self.a_done_toggle = self._act(
+            "Mark done / &not done", self.toggle_done_selection, "Ctrl+Return",
+            "Flip the done mark on every selected page - the inverse of Enter")
+        self.a_rot_ccw = self._act("Rotate 90° &left",
+                                   lambda: self._nudge_quadrant(-1), tip="Rotate 90° left",
+                                   icon="rot_ccw")
+        self.a_rot_cw = self._act("Rotate 90° &right",
+                                  lambda: self._nudge_quadrant(1), tip="Rotate 90° right",
+                                  icon="rot_cw")
+        self.a_flip_h = self._act("Flip &horizontally",
+                                  lambda: self._flip(True), tip="Mirror left to right",
+                                  icon="flip_h")
+        self.a_flip_v = self._act("Flip &vertically",
+                                  lambda: self._flip(False), tip="Mirror top to bottom",
+                                  icon="flip_v")
         self.a_spread = self._act("Align as &spread…", self.open_spread, "Ctrl+J",
                                   "Align two facing pages", icon="spread")
         self.a_remove = self._act("&Remove from queue", self.remove_selected, "Del")
@@ -295,19 +424,17 @@ class MainWindow(QMainWindow):
                                        "V", "Cursor — pan, zoom, adjust an "
                                             "existing crop", checkable=True,
                                        icon="cursor")
-        self.a_tool_crop = self._act("&Crop", lambda: self.set_tool(Tool.CROP), "C",
-                                     "Draw a new crop (one use, then back to cursor)",
+        self.a_tool_crop = self._act("&Crop page",
+                                     lambda: self.set_tool(Tool.CROP), "C",
+                                     "Crop this page only (one use, then back "
+                                     "to the cursor)",
                                      checkable=True, icon="crop")
-        self.a_tool_line = self._act("Place &alignment guide",
-                                     lambda: self.set_tool(Tool.ALIGN), "L",
-                                     "Lay down a straightedge, then turn the "
-                                     "page onto it", checkable=True, icon="level")
-        self.a_guide_rotate = self._act("Rotate page to &guide",
-                                        lambda: self.canvas.rotate_page_to_guide(),
-                                        "Ctrl+L",
-                                        "Turn the page so the guide becomes level")
-        self.a_guide_drop = self._act("Clear alignment guide",
-                                      lambda: self.canvas.clear_guide(), "Shift+L")
+        self.a_tool_crop_all = self._act("Crop &all pages",
+                                         lambda: self.set_tool(Tool.CROP_ALL),
+                                         "Shift+C",
+                                         "Draw one crop and give it to every "
+                                         "page in the project",
+                                         checkable=True, icon="crop_all")
         self.a_tool_blur = self._act("&Blur a spot",
                                      lambda: self.set_tool(Tool.BLUR), "B",
                                      "Drag out a blur over something on the page",
@@ -345,7 +472,7 @@ class MainWindow(QMainWindow):
                                        "of each other onto one exact size",
                                        icon="matchsize")
         grp = QActionGroup(self)
-        for a in (self.a_tool_cursor, self.a_tool_crop, self.a_tool_line,
+        for a in (self.a_tool_cursor, self.a_tool_crop, self.a_tool_crop_all,
                   self.a_tool_blur, self.a_tool_cut):
             grp.addAction(a)
         self.a_tool_cursor.setChecked(True)
@@ -360,21 +487,22 @@ class MainWindow(QMainWindow):
             m_file.addSeparator() if a is None else m_file.addAction(a)
 
         m_edit = self.menuBar().addMenu("&Edit")
-        for a in (self.a_undo, self.a_redo, None, self.a_deskew, self.a_fitpage,
+        for a in (self.a_undo, self.a_redo, None, self.a_fitpage,
                   self.a_auto_both, None, self.a_clear_crop, self.a_reset, None,
-                  self.a_link, self.a_copy_prev, self.a_apply_doc,
+                  self.a_copy_prev, self.a_apply_doc,
                   self.a_apply_sel, None, self.a_set_doc):
             m_edit.addSeparator() if a is None else m_edit.addAction(a)
 
         m_view = self.menuBar().addMenu("&View")
         for a in (self.a_book, None,
-                  self.a_fit, self.a_100, self.a_50, self.a_zoomin, self.a_zoomout,
-                  None, self.a_grid, self.a_thirds, self.a_dim, None,
+                  self.a_fit, self.a_zoomin, self.a_zoomout,
+                  None, self.a_grid, self.a_dim, None,
                   self.a_guide_h, self.a_guide_v, self.a_guide_clear):
             m_view.addSeparator() if a is None else m_view.addAction(a)
 
         m_page = self.menuBar().addMenu("&Page")
-        for a in (self.a_prev, self.a_next, self.a_done_next, None, self.a_up,
+        for a in (self.a_prev, self.a_next, self.a_done_next, self.a_done_toggle,
+                  None, self.a_up,
                   self.a_down, self.a_move_to, None, self.a_spread, self.a_join,
                   self.a_unjoin, None, self.a_remove):
             m_page.addSeparator() if a is None else m_page.addAction(a)
@@ -385,9 +513,9 @@ class MainWindow(QMainWindow):
             m_cut.addSeparator() if a is None else m_cut.addAction(a)
 
         m_tools = self.menuBar().addMenu("&Tools")
-        for a in (self.a_tool_cursor, self.a_tool_crop, self.a_tool_line,
-                  self.a_tool_blur, self.a_tool_cut, None, self.a_guide_rotate,
-                  self.a_guide_drop, self.a_blur_delete, None,
+        for a in (self.a_tool_cursor, self.a_tool_crop, self.a_tool_crop_all,
+                  self.a_tool_blur, self.a_tool_cut, None,
+                  self.a_blur_delete, None,
                   self.a_match_sizes, None, self.a_cache):
             m_tools.addSeparator() if a is None else m_tools.addAction(a)
 
@@ -402,47 +530,108 @@ class MainWindow(QMainWindow):
         main.setMovable(False)
         main.setToolButtonStyle(Qt.ToolButtonIconOnly)
         main.setIconSize(QSize(ICON_PX, ICON_PX))
+        # The top bar is the document and the view: what you are working on,
+        # and how you are looking at it.  Nothing here changes a page.
         for a in (self.a_open_folder, self.a_save, self.a_save_as, self.a_export,
-                  None, self.a_undo, self.a_redo, None, self.a_grid):
+                  None, self.a_undo, self.a_redo,
+                  None, self.a_guide_h, self.a_guide_v, self.a_guide_clear,
+                  None, self.a_grid, self.a_book):
             main.addSeparator() if a is None else main.addAction(a)
         self.addToolBar(main)
         self.toolbar_main = main
 
-        self.addToolBarBreak()
+        # ...and the column beside the canvas is the editing: tools, framing,
+        # the automatic passes, and the tick that finishes a page.
+        self.tool_column = ToolColumn([
+            [self.a_tool_cursor, self.a_tool_crop,
+             self.a_tool_crop_all, self.a_tool_blur, self.a_tool_cut],
+            [self.a_rot_ccw, self.a_rot_cw, self.a_flip_h, self.a_flip_v],
+            [self.a_copy_prev, self.a_match_sizes,
+             self.a_spread, self.a_join],
+            [self.a_auto_both, self.a_fitpage],
+            [self.a_done_next],
+        ], ICON_PX, self)
+        self.work_layout.insertWidget(0, self.tool_column)
+        self.toolbar_tools = self.tool_column
 
-        tools = QToolBar("Tools")
-        tools.setObjectName("toolbar")
-        tools.setMovable(False)
-        tools.setToolButtonStyle(Qt.ToolButtonIconOnly)
-        tools.setIconSize(QSize(ICON_PX, ICON_PX))
-        # selection tools | page tools | auto tools | zoom | done
-        for a in (self.a_tool_cursor, self.a_tool_crop, self.a_tool_line,
-                  self.a_tool_blur, self.a_tool_cut,
-                  None, self.a_link, self.a_copy_prev, self.a_match_sizes,
-                  self.a_spread, self.a_join,
-                  None, self.a_auto_both, self.a_deskew, self.a_fitpage,
-                  None, self.a_fit, self.a_100, self.a_book,
-                  None, self.a_done_next):
-            tools.addSeparator() if a is None else tools.addAction(a)
-        self.addToolBar(tools)
-        self.toolbar_tools = tools
+    # The slider is logarithmic: the useful range runs from a whole 140 MP page
+    # in a window (about 6%) to a few hundred percent, and a linear slider
+    # spends nine tenths of its travel above 100% where nothing is ever set.
+    ZOOM_MIN, ZOOM_MAX, ZOOM_STEPS = 3.0, 400.0, 1000
+
+    def _zoom_to_slider(self, pct: float) -> int:
+        import math as _m
+        pct = max(self.ZOOM_MIN, min(self.ZOOM_MAX, pct))
+        t = ((_m.log(pct) - _m.log(self.ZOOM_MIN))
+             / (_m.log(self.ZOOM_MAX) - _m.log(self.ZOOM_MIN)))
+        return int(round(t * self.ZOOM_STEPS))
+
+    def _slider_to_zoom(self, v: int) -> float:
+        import math as _m
+        t = max(0, min(self.ZOOM_STEPS, v)) / float(self.ZOOM_STEPS)
+        return _m.exp(_m.log(self.ZOOM_MIN)
+                      + t * (_m.log(self.ZOOM_MAX) - _m.log(self.ZOOM_MIN)))
 
     def _build_statusbar(self):
         sb = QStatusBar()
+        sb.setSizeGripEnabled(False)
         self.throbber = Throbber(14)
         sb.addPermanentWidget(self.throbber)
         self.lbl_pos = QLabel("—")
-        self.lbl_zoom = QLabel("")
         self.lbl_progress = QLabel("")
-        for w in (self.lbl_progress, self.lbl_pos, self.lbl_zoom):
+        for w in (self.lbl_progress, self.lbl_pos):
             w.setStyleSheet("color:#9aa0aa;padding:0 10px;")
             sb.addPermanentWidget(w)
+
+        # Fit, then the zoom slider, in the far corner - the one place a zoom
+        # control is always looked for, and the status bar was carrying three
+        # readouts and nothing you could operate.
+        self.btn_fit = QToolButton()
+        self.btn_fit.setDefaultAction(self.a_fit)
+        self.btn_fit.setIconSize(QSize(16, 16))
+        self.btn_fit.setAutoRaise(True)
+        sb.addPermanentWidget(self.btn_fit)
+
+        self.zoom_slider = QSlider(Qt.Horizontal)
+        self.zoom_slider.setRange(0, self.ZOOM_STEPS)
+        self.zoom_slider.setFixedWidth(150)
+        self.zoom_slider.setPageStep(self.ZOOM_STEPS // 12)
+        self.zoom_slider.setToolTip("Zoom — Ctrl+wheel over the page does the same")
+        self.zoom_slider.valueChanged.connect(self._zoom_slider_moved)
+        sb.addPermanentWidget(self.zoom_slider)
+
+        self.lbl_zoom = QLabel("—")
+        self.lbl_zoom.setMinimumWidth(52)
+        self.lbl_zoom.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.lbl_zoom.setStyleSheet("color:#9aa0aa;padding:0 10px 0 4px;")
+        sb.addPermanentWidget(self.lbl_zoom)
+        self._zoom_guard = False
         self.setStatusBar(sb)
+
+    def _zoom_slider_moved(self, v: int) -> None:
+        if self._zoom_guard:
+            return
+        self.canvas.set_zoom_percent(self._slider_to_zoom(v))
+
+    def _zoom_changed(self, pct: float) -> None:
+        """The canvas moved; follow it without driving it back."""
+        self._zoom_guard = True
+        try:
+            self.zoom_slider.setValue(self._zoom_to_slider(pct))
+        finally:
+            self._zoom_guard = False
+        self.lbl_zoom.setText(f"{pct:.0f}%" if pct >= 10 else f"{pct:.1f}%")
 
     def _wire(self):
         c = self.canvas
         c.editChanged.connect(self._canvas_edited)
-        c.statusMessage.connect(self.lbl_zoom.setText)
+        c.statusMessage.connect(lambda t: self.statusBar().showMessage(t, 4000))
+        c.zoomChanged.connect(self._zoom_changed)
+        c.cropDrawn.connect(self._crop_drawn)
+        # one place to decide whether the zoom controls mean anything, fed by
+        # the canvas itself rather than by every caller that loads a page
+        c.pageChanged.connect(self._update_zoom_enabled)
+        c.filesDropped.connect(self.take_dropped_paths)
         c.cursorMoved.connect(self._cursor_moved)
         c.interactionStarted.connect(self._begin_history)
         c.interactionEnded.connect(self._end_history)
@@ -452,13 +641,11 @@ class MainWindow(QMainWindow):
         for sb in (c.horizontalScrollBar(), c.verticalScrollBar()):
             sb.valueChanged.connect(lambda _v: self._detail_timer.start())
 
+        self.angle_strip.angleChanged.connect(self._set_angle)
+
         i = self.inspector
-        i.angleChanged.connect(self._set_angle)
         i.cropChanged.connect(self._set_crop)
-        i.orientationChanged.connect(self._set_orientation)
-        i.requestAutoDeskew.connect(self.auto_deskew)
         i.requestFitToPage.connect(self.fit_to_page)
-        i.requestStraightenTool.connect(lambda: self.set_tool(Tool.ALIGN))
         i.requestCropTool.connect(lambda: self.set_tool(Tool.CROP))
         i.requestBlurTool.connect(lambda: self.set_tool(Tool.BLUR))
         i.requestBlurDelete.connect(lambda: self.canvas.delete_blur())
@@ -471,15 +658,17 @@ class MainWindow(QMainWindow):
         i.requestApplyToSelection.connect(self.apply_to_selection)
         i.aspectChanged.connect(lambda r: setattr(self.canvas, "lock_aspect", r))
         i.doneToggled.connect(self._set_done)
-        i.linkToggled.connect(self._set_link)
         i.cropModeChanged.connect(self._set_crop_mode)
 
         q = self.queue
         q.pageActivated.connect(self.show_page)
-        q.pagesDropped.connect(self.add_paths)
+        # the same route as every other drop target, so a .sfproj dropped on
+        # the grid opens rather than being added as if it were a scan
+        q.pagesDropped.connect(self.take_dropped_paths)
         q.removeRequested.connect(self.remove_uids)
         q.orderChanged.connect(self.history.capture)
         q.setDocumentRequested.connect(self.set_document_name)
+        q.doneToggleRequested.connect(self.toggle_done_selection)
         q.spreadRequested.connect(self.open_spread)
         q.joinRequested.connect(self.join_pages)
         q.unjoinRequested.connect(self.unjoin_page)
@@ -489,23 +678,44 @@ class MainWindow(QMainWindow):
         self.bg.done.connect(self._bg_done)
         self.bg.failed.connect(self._bg_failed)
 
+    def _settle_right_column(self) -> None:
+        """Give the page grid the room and the panel what it needs.
+
+        Splitter sizes set before a widget has been laid out are guesses; this
+        runs once the column has a real height.
+        """
+        total = sum(self.right_col.sizes()) or self.right_col.height()
+        if total <= 0:
+            return
+        want_panel = min(int(total * 0.42),
+                         self.inspector.sizeHint().height() + 12)
+        want_panel = max(120, want_panel)
+        self.right_col.setSizes([max(340, total - want_panel), want_panel])
+
     def _snap_queue_width(self, *_args) -> None:
         """Let the queue be a whole number of pages wide, and nothing else.
 
         Dragging the divider to an arbitrary pixel leaves a strip the grid
         cannot use - the pages do not grow into it and nothing else can go
         there - so the divider settles on the nearest column boundary instead.
+
+        Two columns is the floor.  One column is a list, not a grid: you lose
+        the shape of the document, which is the thing the panel is for, and the
+        splitter reaches that state on its own whenever the window is too
+        narrow for everyone's preferred width at once.
         """
         sizes = self.splitter.sizes()
-        if len(sizes) < 2 or sizes[0] <= 0:
+        if len(sizes) < 2 or sizes[1] <= 0:
             return
-        want = self.queue.snapped_width(sizes[0])
-        delta = want - sizes[0]
+        want = max(self.queue.snapped_width(sizes[1]),
+                   self.queue.width_for_columns(2))
+        delta = want - sizes[1]
+        self.queue.setMinimumWidth(self.queue.width_for_columns(2))
         if not delta:
             return
-        # take the difference from the canvas, which is the elastic one
-        sizes[0] = want
-        sizes[1] = max(120, sizes[1] - delta)
+        # take the difference from the editing area, which is the elastic one
+        sizes[1] = want
+        sizes[0] = max(200, sizes[0] - delta)
         self.splitter.setSizes(sizes)
 
     def eventFilter(self, obj, ev):
@@ -600,14 +810,11 @@ class MainWindow(QMainWindow):
     def _after_history(self, message: str) -> None:
         self._dirty = True
         uid = self._current.uid if self._current else None
-        self.a_link.setChecked(self.project.link_crop)
-        self.inspector.set_link(self.project.link_crop)
         # Undo changes page state, never the pixels on disk, so the decoded
         # thumbnails stay valid.  Discarding them here made every Ctrl+Z re-read
         # every thumbnail from the cache on the interface thread.
         self.queue.drop_stale_icons()
         self.queue.rebuild()
-        self._rearm_first_crop()
         page = self.project.by_uid(uid) if uid else None
         if page is None and self.project.pages:
             page = self.project.pages[0]
@@ -618,12 +825,14 @@ class MainWindow(QMainWindow):
                 self._reorient()          # undo may have changed the orientation
                 self.canvas.set_page(page, self._proxy)
                 self.inspector.set_page(page)
+                self.angle_strip.set_page(page)
             else:
                 self.show_page(page.uid)
         else:
             self._current = None
             self.canvas.set_page(None, None)
             self.inspector.set_page(None)
+            self.angle_strip.set_page(None)
         self.statusBar().showMessage(message, 3000)
 
     # ------------------------------------------------------------ page load
@@ -654,6 +863,7 @@ class MainWindow(QMainWindow):
         idx = self.project.index_of(uid) + 1
         self.lbl_progress.setText(f"Page {idx} of {len(self.project.pages)}")
         self.inspector.set_page(page)
+        self.angle_strip.set_page(page)
 
         # Cached proxies come back in about 50 ms, so read those inline; a page
         # that still needs decoding goes to a worker instead of freezing the UI.
@@ -730,27 +940,9 @@ class MainWindow(QMainWindow):
         self._reorient()
         self.canvas.set_page(page, self._proxy)
         self.inspector.set_page(page)
+        self.angle_strip.set_page(page)
         self.inspector.set_blur(-1, None)
-        self._maybe_arm_first_crop(page)
-
-    def _maybe_arm_first_crop(self, page: PageEdit) -> None:
-        """A new project opens ready to crop.
-
-        Cropping is the first thing you do to a fresh set of scans, and with
-        the crop shared across the project it is a single action for the whole
-        document - so the tool arms itself once, then releases as usual.
-        """
-        if not self._first_crop_pending or page.crop is not None:
-            return
-        if any(p.crop for p in self.project.pages):
-            self._first_crop_pending = False
-            return
-        self._first_crop_pending = False
-        self._rearm_first_crop()
-        self.set_tool(Tool.CROP)
-        self.statusBar().showMessage(
-            "Draw the crop for this document — it will be applied to all "
-            f"{len(self.project.pages)} pages", 12000)
+        self._update_zoom_enabled()
 
     def _on_loaded(self, path: str, tier: str, arr) -> None:
         if self._current is None or arr is None:
@@ -816,55 +1008,45 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------------- editing
     def _commit_crop(self) -> None:
-        """Propagate the current page's crop if the project is linked."""
-        if self._current is None:
-            return
-        n = self.project.apply_linked_crop(self._current)
-        if n:
-            self._queue_timer.start()
-        # A page exempt from the shared crop cannot be the crop that shapes the
-        # document: cropping a joined or spread page propagates nothing, so
-        # releasing the link there would leave the rest of the pages uncropped
-        # and the link switched off.
-        if (getattr(self, "_first_crop_armed", False) and self._current.crop
-                and self._current.crop_mode != "locked"):
-            self._release_project_crop(n)
+        """A crop moved on the current page.  It stays on that page.
 
-    def _rearm_first_crop(self) -> None:
-        """Work out whether the next crop is the one that shapes the document.
-
-        Derived from the project rather than remembered, because a remembered
-        flag does not survive undo: cropping, undoing and cropping again left
-        the shared crop switched on for the rest of the session, which is the
-        exact failure the release exists to prevent.
+        This used to push the crop onto every other page whenever a
+        project-wide switch was on, which meant a careful nudge on page 40 was
+        copied silently over the thirty-nine before it.  Reaching the whole
+        document is something you now ask for by name, with the "crop all
+        pages" tool, and nothing else does it behind your back.
         """
-        self._first_crop_armed = (self.project.link_crop
-                                  and not any(p.crop for p in self.project.pages))
-
-    def _release_project_crop(self, applied: int) -> None:
-        """Turn the project-wide crop off once it has done its job.
-
-        The shared crop exists to answer one question - what shape is this
-        document - and it answers it the first time you draw a crop.  Leaving
-        it switched on after that is what made careful per-page work disappear:
-        every later nudge on any page was quietly copied over all the others.
-        So it releases itself, exactly like the crop tool does, and can be
-        switched back on from the tool bar when it is genuinely wanted.
-        """
-        self._first_crop_armed = False
-        if not self.project.link_crop:
-            return
-        self.project.link_crop = False
-        self.a_link.setChecked(False)
-        self.inspector.set_link(False)
         self._dirty = True
-        total = sum(1 for p in self.project.pages if p.crop)
-        self.statusBar().showMessage(
-            f"Crop applied to {total} pages. The project-wide crop is now "
-            f"off, so further adjustments only affect the page you are on.",
-            12000)
 
-    # ------------------------------------------------------- cache warming
+    def _crop_drawn(self, to_all: bool) -> None:
+        """The crop tool finished a rectangle."""
+        if self._current is None or not to_all:
+            return
+        n = self.project.apply_crop_to_all(self._current)
+        if n:
+            self.queue.forget_thumbs()
+            self._queue_timer.start()
+        locked = len(self.project.locked_pages())
+        self.statusBar().showMessage(
+            f"Crop given to {n + 1} pages"
+            + (f", leaving {locked} locked" if locked else ""), 6000)
+        self._dirty = True
+
+    def _update_zoom_enabled(self) -> None:
+        """The zoom controls only mean something with a page on the canvas.
+
+        They used to work on an empty canvas, and the view transform stuck: the
+        first page you opened then arrived at whatever magnification the
+        emptiness had been left at.
+        """
+        on = self.canvas.edit is not None and self.canvas._pix is not None
+        for w in (self.zoom_slider, self.btn_fit):
+            w.setEnabled(on)
+        for act in (self.a_fit, self.a_zoomin, self.a_zoomout):
+            act.setEnabled(on)
+        if not on:
+            self.lbl_zoom.setText("—")
+
     def _start_caching(self, pages: list) -> None:
         """Ask for every page's pixels.  Runs inside the import modal.
 
@@ -943,6 +1125,7 @@ class MainWindow(QMainWindow):
         self._dirty = True
         self._commit_crop()
         self.inspector.refresh()
+        self.angle_strip.refresh()
         if self._current:
             self.queue.refresh_item(self._current.uid)
 
@@ -960,6 +1143,20 @@ class MainWindow(QMainWindow):
         self.canvas.viewport().update()
         self.inspector.refresh_output()
         self._dirty = True
+
+    def _nudge_quadrant(self, direction: int) -> None:
+        e = self._current
+        if e is None:
+            return
+        self._set_orientation((e.quadrant + direction) % 4, e.flip_h, e.flip_v)
+
+    def _flip(self, horizontal: bool) -> None:
+        e = self._current
+        if e is None:
+            return
+        self._set_orientation(e.quadrant,
+                              (not e.flip_h) if horizontal else e.flip_h,
+                              e.flip_v if horizontal else (not e.flip_v))
 
     def _set_orientation(self, quadrant: int, fh: bool, fv: bool) -> None:
         """Turn or flip the page, bringing the crop and blurs along with it.
@@ -1016,33 +1213,17 @@ class MainWindow(QMainWindow):
             return
         self.canvas.set_page(self._current, self._proxy)
         self.inspector.set_page(self._current)
+        self.angle_strip.set_page(self._current)
         self._dirty = True
 
     def _set_done(self, on: bool) -> None:
         if self._current and self._current.done != on:
+            # captured like every other page change: unticking the box was the
+            # one edit in the app that undo could not take back
+            self.history.capture("Mark done" if on else "Mark not done")
             self._current.done = on
             self.queue.refresh_item(self._current.uid)
             self._dirty = True
-
-    def _set_link(self, on: bool) -> None:
-        if self.project.link_crop == on:
-            return
-        self.history.capture("Link crops" if on else "Unlink crops")
-        self.project.link_crop = on
-        self.a_link.setChecked(on)
-        # switching the link back on by hand is a deliberate act; it must not
-        # then switch itself off again on the next crop
-        self._rearm_first_crop()
-        if on:
-            self._commit_crop()
-        self._dirty = True
-        self.statusBar().showMessage(
-            "Every page now shares one crop" if on
-            else "Pages can be cropped independently", 4000)
-
-    def toggle_link(self, on: bool) -> None:
-        self._set_link(on)
-        self.inspector.set_link(on)
 
     def _set_crop_mode(self, mode: str) -> None:
         if self._current is None or self._current.crop_mode == mode:
@@ -1052,7 +1233,7 @@ class MainWindow(QMainWindow):
         self._dirty = True
         self.queue.refresh_item(self._current.uid)
         self.statusBar().showMessage(
-            {"linked": "This page follows the shared crop",
+            {"linked": "This page takes a crop-all",
              "own_position": "This page keeps its own position, shared size",
              "locked": "This page's crop is locked — nothing will overwrite it",
              }.get(mode, ""), 4000)
@@ -1061,7 +1242,7 @@ class MainWindow(QMainWindow):
         self.canvas.tool = tool
         self.a_tool_cursor.setChecked(tool == Tool.CURSOR)
         self.a_tool_crop.setChecked(tool == Tool.CROP)
-        self.a_tool_line.setChecked(tool == Tool.ALIGN)
+        self.a_tool_crop_all.setChecked(tool == Tool.CROP_ALL)
         self.a_tool_blur.setChecked(tool == Tool.BLUR)
         self.a_tool_cut.setChecked(tool == Tool.CUT)
         if tool != Tool.CUT:
@@ -1072,11 +1253,14 @@ class MainWindow(QMainWindow):
                 6000)
         elif tool == Tool.CROP:
             self.statusBar().showMessage(
-                "Drag to draw one crop — the tool releases afterwards", 6000)
-        elif tool == Tool.ALIGN:
+                "Drag to crop this page — the tool releases afterwards", 6000)
+        elif tool == Tool.CROP_ALL:
+            n = len(self.project.pages)
+            locked = len(self.project.locked_pages())
             self.statusBar().showMessage(
-                "Drag out the straightedge — it stays put, and you turn the "
-                "page onto it with [ and ]. Alt keeps a free angle.", 8000)
+                f"Drag one crop for all {n} pages"
+                + (f" — {locked} locked pages keep their own" if locked else "")
+                + ". The tool releases afterwards.", 8000)
         elif tool == Tool.CUT:
             self.statusBar().showMessage(
                 "Click where the scan should be cut — Shift cuts across "
@@ -1096,12 +1280,30 @@ class MainWindow(QMainWindow):
         if self.canvas.tool != Tool.CURSOR:
             self.set_tool(Tool.CURSOR)
 
+    def _add_guide(self, horizontal: bool) -> None:
+        """Drop a guide across the middle of what you are looking at.
+
+        Guides replaced the straightedge: rather than tracing a line along a
+        crooked baseline and turning the page onto it, you lay down a line that
+        is level by construction and nudge the angle until the baseline meets
+        it.  Same judgement, one fewer thing to get wrong - a straightedge that
+        is itself a fifth of a degree out aligns the page to its own error.
+        """
+        if self.canvas.edit is None:
+            self.statusBar().showMessage("Open a page first", 3000)
+            return
+        self.canvas.add_guide(horizontal)
+        n = len(self.canvas.guides_h) + len(self.canvas.guides_v)
+        self.statusBar().showMessage(
+            f"Guide added — drag it where you need it, then nudge the angle "
+            f"until the page meets it  ({n} on the page)", 6000)
+
+    def _clear_guides(self) -> None:
+        self.canvas.clear_guides()
+        self.statusBar().showMessage("Guides cleared", 2500)
+
     def toggle_grid(self, on: bool) -> None:
         self.canvas.show_grid = on
-        self.canvas.viewport().update()
-
-    def toggle_thirds(self, on: bool) -> None:
-        self.canvas.show_thirds = on
         self.canvas.viewport().update()
 
     def toggle_dim(self, on: bool) -> None:
@@ -1113,14 +1315,7 @@ class MainWindow(QMainWindow):
             return
         self.history.capture("Clear crop")
         self.canvas.reset_crop()
-        if self.project.link_crop:
-            for p in self.project.pages:
-                p.crop = None
-            self.queue.forget_thumbs()
-            self.queue.refresh_all_labels()
         self._dirty = True
-        # back to an uncropped document, so the next crop is the first one again
-        self._rearm_first_crop()
 
     def select_all_crop(self) -> None:
         self.history.capture("Whole page")
@@ -1131,22 +1326,6 @@ class MainWindow(QMainWindow):
     # second, but a fraction of a second of frozen window on every page adds up
     # to something that feels broken, so they go to a worker thread like
     # everything else and report back by signal.
-    def auto_deskew(self) -> None:
-        if self._current is None or self._proxy is None:
-            return
-        if not self._claim("deskew", "Measuring skew…"):
-            return
-        self.bg.run(f"deskew:{self._current.uid}", autodetect.detect_skew, self._proxy)
-
-    def _done_deskew(self, uid: str, angle: float) -> None:
-        page = self.project.by_uid(uid)
-        if page is None or self._current is not page:
-            return
-        self.history.capture("Auto-deskew")
-        self.canvas.set_angle(round(page.angle + angle, 3))
-        self.inspector.refresh()
-        self.statusBar().showMessage(f"Deskewed by {angle:+.3f}°", 4000)
-
     def fit_to_page(self) -> None:
         if self._current is None or self._proxy is None:
             return
@@ -1169,9 +1348,9 @@ class MainWindow(QMainWindow):
         self._commit_crop()
         self.canvas.viewport().update()
         self.inspector.refresh()
+        self.angle_strip.refresh()
         self._dirty = True
-        note = " and applied to every page" if self.project.link_crop else ""
-        self.statusBar().showMessage(f"Crop set to the detected page edges{note}", 4000)
+        self.statusBar().showMessage("Crop set to the detected page edges", 4000)
 
     @staticmethod
     def _auto_both_work(proxy):
@@ -1203,6 +1382,7 @@ class MainWindow(QMainWindow):
             self._commit_crop()
         self.canvas.viewport().update()
         self.inspector.refresh()
+        self.angle_strip.refresh()
         self._dirty = True
         self.statusBar().showMessage(
             f"Straightened by {angle:+.3f}° and cropped to the sheet", 4000)
@@ -1391,9 +1571,15 @@ class MainWindow(QMainWindow):
         self.center.addWidget(pane)
         self.center.setCurrentWidget(pane)
         pane.setFocus()
+        # Hold the divider positions: adding a wider pane to the stack makes
+        # the splitter take the room from the queue, which collapsed it to one
+        # column and left it there after the aligner closed.
+        self._sizes_before_mode = self.splitter.sizes()
+        self.queue.restrict_to({left.uid, right.uid})
+        self.inspector.setEnabled(False)
         self.statusBar().showMessage(
-            "Aligning — the queue and the inspector stay where they are; "
-            "Esc leaves the aligner", 8000)
+            "Aligning — the rest of the queue and the inspector are out of "
+            "play until you leave; Esc leaves the aligner", 8000)
 
     def close_mode(self) -> None:
         """Back to the editing canvas."""
@@ -1404,6 +1590,13 @@ class MainWindow(QMainWindow):
         self.center.setCurrentWidget(self.canvas)
         self.center.removeWidget(pane)
         pane.deleteLater()
+        self.queue.clear_restriction()
+        self.inspector.setEnabled(True)
+        sizes = getattr(self, "_sizes_before_mode", None)
+        if sizes and len(sizes) == len(self.splitter.sizes()):
+            self.splitter.setSizes(sizes)
+        self._sizes_before_mode = None
+        self._snap_queue_width()
         self.canvas.setFocus()
 
     def _after_spread(self, left: PageEdit, right: PageEdit) -> None:
@@ -1413,11 +1606,12 @@ class MainWindow(QMainWindow):
             self.queue.refresh_item(p.uid)
         if self._current and self._current.uid in (left.uid, right.uid):
             self.inspector.set_page(self._current)
+            self.angle_strip.set_page(self._current)
             self._reload_current()
-        if left.crop_mode == "locked" and self.project.link_crop:
+        if left.crop_mode == "locked":
             self.statusBar().showMessage(
-                "Spread saved. Both pages are now locked, so the shared crop "
-                "will not overwrite their alignment.", 8000)
+                "Spread saved. Both pages are locked, so \"crop all pages\" "
+                "leaves their alignment alone.", 8000)
 
     # ------------------------------------------------------------- cut / join
     def _do_cut(self, axis: str, fractions) -> None:
@@ -1527,15 +1721,33 @@ class MainWindow(QMainWindow):
         uids, size = dlg.result_target()
         if not uids:
             return
+        wanted = set(uids)
+        before = {p.uid: p.output_size() for p in self.project.pages
+                  if p.uid in wanted}
         self.history.capture("Match crop sizes")
         n = self.project.match_sizes(uids, size)
         self._dirty = True
-        self.queue.rebuild()
+        moved = [p for p in self.project.pages
+                 if p.uid in wanted and p.output_size() != before.get(p.uid)]
+        # The thumbnails are keyed on the crop, so they would be rebuilt anyway
+        # - but only for pages the grid happens to redraw.  Dropping them for
+        # the pages that actually moved is what makes the change visible in the
+        # grid rather than several scrolls later.
+        self.queue.forget_thumbs([p.path for p in moved])
+        self.queue.rebuild(self.queue.current_uid())
         if self._current is not None:
             self._reload_current()
-            self.inspector.set_page(self._current)
-        self.statusBar().showMessage(
-            f"{n} pages now export at exactly {size[0]}×{size[1]}", 6000)
+        if not moved:
+            self.statusBar().showMessage(
+                f"All {n} pages were already {size[0]}×{size[1]} — "
+                "nothing needed moving", 6000)
+        else:
+            biggest = max(
+                max(abs(p.output_size()[0] - before[p.uid][0]),
+                    abs(p.output_size()[1] - before[p.uid][1])) for p in moved)
+            self.statusBar().showMessage(
+                f"{len(moved)} of {n} pages resized to {size[0]}×{size[1]} — "
+                f"the largest change was {biggest} px", 6000)
 
     # ------------------------------------------------------------- file ops
     def open_folder(self) -> None:
@@ -1598,15 +1810,12 @@ class MainWindow(QMainWindow):
         self._current = None
         self._proxy_raw = self._proxy = None
         self._spread_pick = None
-        self._first_crop_pending = True
-        self._first_crop_armed = False
         self.queue.forget_thumbs()
         self.queue.rebuild()
         self.canvas.set_page(None, None)
         self.canvas.set_message("Drop a folder of scans here, or press Ctrl+O")
         self.inspector.set_page(None)
-        self.a_link.setChecked(True)
-        self.inspector.set_link(True)
+        self.angle_strip.set_page(None)
         self._dirty = False
         self._update_title()
         return True
@@ -1734,6 +1943,7 @@ class MainWindow(QMainWindow):
                 self.canvas.set_message(
                     "Drop a folder of scans here, or press Ctrl+O")
                 self.inspector.set_page(None)
+                self.angle_strip.set_page(None)
             return
 
         self.queue.rebuild()
@@ -1779,8 +1989,8 @@ class MainWindow(QMainWindow):
         # if the project already has a crop, new pages inherit it
         anchor = next((p for p in self.project.pages
                        if p.crop and p not in added), None)
-        if anchor is not None and self.project.link_crop:
-            self.project.apply_linked_crop(anchor)
+        if anchor is not None:
+            self.project.apply_crop_to_all(anchor)
         # Every page is read now, while the window is shut, rather than the
         # first click on page 30 sitting there decoding a 140 MP TIFF with
         # nothing on screen to say why.
@@ -1807,6 +2017,7 @@ class MainWindow(QMainWindow):
             self.canvas.set_page(None, None)
             self.canvas.set_message("")
             self.inspector.set_page(None)
+            self.angle_strip.set_page(None)
             if self.project.pages:
                 nxt = self.project.pages[min(idx, len(self.project.pages) - 1)]
                 self.queue.select(nxt.uid)
@@ -1827,12 +2038,24 @@ class MainWindow(QMainWindow):
 
     def dropEvent(self, ev):
         paths = [u.toLocalFile() for u in ev.mimeData().urls() if u.isLocalFile()]
+        self.take_dropped_paths(paths)
+        ev.acceptProposedAction()
+
+    def take_dropped_paths(self, paths: list) -> None:
+        """Scans or a project, dropped anywhere in the window.
+
+        One route for every drop target, so the canvas, the page grid and the
+        empty chrome around them all behave the same way.  A project file wins
+        over loose scans: dropping a .sfproj means "open this", not "add it".
+        """
+        paths = [p for p in paths if p]
+        if not paths:
+            return
         projects = [p for p in paths if p.lower().endswith(".sfproj")]
         if projects:
             self._open_project_file(projects[0])
         else:
             self.add_paths(paths)
-        ev.acceptProposedAction()
 
     # ------------------------------------------------------------- project
     def save_project(self) -> None:
@@ -1869,18 +2092,11 @@ class MainWindow(QMainWindow):
         self.project.path = proj.path
         self.project.last_folder = proj.last_folder
         self.project.export_dir = proj.export_dir
-        self.project.link_crop = proj.link_crop
         self.export_cfg.out_dir = proj.export_dir or self.export_cfg.out_dir
-        self.a_link.setChecked(proj.link_crop)
-        self.inspector.set_link(proj.link_crop)
         self.history.clear()
         self.queue.forget_thumbs()
         self.queue.rebuild()
-        # a reopened project is not a fresh one: whether the next crop is the
-        # document's first is decided by what is in it, not by what the last
-        # project was doing
-        self._first_crop_pending = False
-        self._rearm_first_crop()
+
         missing = [p.name for p in self.project.pages if not os.path.exists(p.path)]
         if missing:
             QMessageBox.warning(self, "Missing files",
@@ -1955,9 +2171,16 @@ class MainWindow(QMainWindow):
         s = self.settings.value("splitter")
         if s:
             self.splitter.restoreState(s)
+        # restoreState carries the handle width and the collapsible flag with
+        # it, so a state saved before these were set would quietly put the
+        # thin, collapsible divider back.  They are the app's choice, not the
+        # session's.
+        self.splitter.setHandleWidth(10)
+        self.splitter.setChildrenCollapsible(False)
         # once the panel has a real size to measure, put the divider on a
         # column boundary - including the width restored from last time
         QTimer.singleShot(0, self._snap_queue_width)
+        QTimer.singleShot(0, self._settle_right_column)
 
     def closeEvent(self, ev):
         if self._dirty and self.project.pages:
@@ -1987,8 +2210,8 @@ class MainWindow(QMainWindow):
 HELP_TEXT = """\
 TOOLS
   V                   cursor - pan, zoom, adjust an existing crop or blur
-  C                   crop - draw ONE new crop, then it releases
-  L                   alignment guide - lay down a straightedge that stays put
+  C                   crop this page - one drag, then it releases
+  Shift+C             crop every page in the project - same, but for all
   B                   blur - drag out a blur over something on the page
   X                   cut - split this scan into separate pages
   Del                 delete the selected blur
@@ -1997,20 +2220,23 @@ TOOLS
 NAVIGATION
   Ctrl+←  Ctrl+→      previous / next page
   Enter               mark done and go to next
-  wheel               zoom at the cursor
-  middle-drag, Space  pan
-  F                   fit page          1 / 2   100% / 50%
+  Ctrl+Enter          mark done / not done - the inverse of Enter
+  wheel               scroll down the page
+  Shift+wheel         scroll across
+  Ctrl+wheel          zoom at the cursor
+  Ctrl++  Ctrl+-      zoom in / out
+  middle-drag          pan
+  F                   fit page   ·   the slider in the status bar zooms too
 
 STRAIGHTENING
   D                   auto-deskew from the text lines
   [  ]                rotate by 0.01°     Shift+[ ]   by 0.10°
-  Ctrl+L              rotate the page so the guide becomes level
-  Shift+L             clear the guide
+  Space  Shift+Space  drop a level / upright guide across the view
 
-The guide is a straightedge, not a command: it stays where you put it while you
-turn the page onto it, and it survives moving between pages so a whole document
-can be squared against the same reference.  Shift constrains it while drawing,
-Alt keeps a free angle instead of snapping to level.
+A guide is a reference, not a command: it lands in the middle of what you are
+looking at, you drag it onto a baseline or a margin, and then you turn the page
+onto it.  It stays put when you change pages, so a whole document can be squared
+against the same line.  These are the same guides the spread aligner uses.
 
 CUTTING AND JOINING
   X                   place a cut line - Shift cuts across instead of down

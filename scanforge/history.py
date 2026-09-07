@@ -20,7 +20,6 @@ from .model import PageEdit, Project
 def snapshot(project: Project) -> dict:
     return {
         "pages": [p.to_dict() for p in project.pages],
-        "link_crop": project.link_crop,
     }
 
 
@@ -35,7 +34,6 @@ def restore(project: Project, state: dict) -> None:
             page.__dict__.update(d)
         pages.append(page)
     project.pages = pages
-    project.link_crop = state.get("link_crop", True)
 
 
 class History:
