@@ -23,10 +23,12 @@ why.
 - [Cropping](#cropping)
 - [Guides, and the straightedge they replaced](#guides-and-the-straightedge-they-replaced)
 - [The page grid](#the-page-grid)
+- [Blurring](#blurring)
 - [Matching crop sizes](#matching-crop-sizes)
 - [Facing pages](#facing-pages)
 - [The book view](#the-book-view)
 - [Export](#export)
+- [Dialogs](#dialogs)
 - [The build and its self-test](#the-build-and-its-self-test)
 
 ---
@@ -205,10 +207,52 @@ The tool column sits **outside** the splitter: it is a fixed width, and a
 divider beside something that cannot be resized is a control that does nothing.
 
 The page grid moved to the right, where you look to see where you are in the
-document rather than what you are doing to one sheet of it. The panel under it
-is a holding position; it scrolls rather than pushing the grid out of the
-column, and the grid keeps at least two rows of pages whatever the panel would
-like.
+document rather than what you are doing to one sheet of it, and it has the
+whole of that column.
+
+### The options bar, and the panel it replaced
+
+For a while there was a panel under the page grid, left over from the old
+inspector. By the end it was mostly repeats — draw a new crop, fit to page
+edges, blur a spot and copy framing were all buttons in the tool column too —
+its result readout was clipped at the edge ("Physi… 3.533 × 5.083 in (89.7 ×"),
+and with no project open it was a wall of disabled controls. What was *not* a
+repeat moved into one strip above the canvas: the crop numbers and what they
+export as, the aspect lock, what crop-all does to this page, the angle, and the
+selected blur. Numbers for the page belong next to the page.
+
+The strip wraps rather than pushing the page grid aside in a narrow window, and
+it leaves with the canvas when a mode takes the work area. It used to be the
+angle strip alone under the canvas, and it stayed live while the aligner was
+open — the slider went on turning the page hidden behind it, the same trap the
+keyboard shortcuts had been. The handlers now refuse edits while a mode is
+open as well, so it does not matter how a change arrives.
+
+### Names on hover, descriptions in the status bar
+
+Every button's tooltip is now its name and key, and the status bar says what
+it does. They used to be the same text — sometimes the name, sometimes a
+sentence — so hovering told you one or the other depending on the button.
+Stripping `&` from menu text to make the name also turned "Auto straighten &&
+crop" into "Auto straighten  crop"; a doubled ampersand is a literal one.
+
+### The first screen
+
+With nothing open, the window used to show one line of grey text in the
+middle of an empty canvas, framed by a disabled tool column, a disabled panel
+and an empty grid — a first screen made of things you could not use yet. It is
+a start screen now: what the app is for, the two ways in, recent projects, and
+one line on how the work goes. The tools, save and export stay off until there
+is a page; undo does not, because removing every page is exactly when you might
+want it back.
+
+### One theme
+
+Colours were written out wherever they were needed: twenty-nine style sheets,
+the same secondary-text grey typed a dozen times, and a few near-greys that
+were meant to be the same one. They are named tokens in `theme.py` now, with
+one application style sheet built from them, and secondary text is marked as
+such (`theme.hint`) rather than coloured by hand.
 
 ### The status bar
 
@@ -257,8 +301,49 @@ this page or to two hundred of them.
 
 The cursor tool deliberately **cannot** start a new rectangle, so a stray click
 on the page can't wipe out framing you spent time on. Handles on an existing
-crop are still live in cursor mode, which is what makes pulling in the
-default full-sheet frame the normal way to crop.
+crop are still live in cursor mode, which is what makes pulling a frame in the
+normal way to crop.
+
+**An uncropped page shows nothing.** It used to be drawn with a frame around
+the whole sheet, handles and all, which is indistinguishable from a full-page
+crop somebody chose — "not cropped yet" and "cropped to the edges" looked
+identical, and the invisible handles meant a click near the edge silently
+created a crop nobody asked for. Now a page nobody has cropped simply looks
+uncropped, and nothing on it is grabbable.
+
+**A click with the crop tool takes the whole page**, handles and all, ready to
+pull in. That is how most pages are actually framed, and it used to require a
+drag from one corner of the scan to the other before you could start. A click
+used to do nothing at all, on the reasoning that it must not commit a
+one-pixel crop — true, but "do nothing" was not the only other option.
+
+**Editing the crop across the document is a toggle — but a visible one.**
+Crop-all sets one rectangle on every page; it had no way to *adjust* that
+rectangle afterwards short of drawing it again. *Edit all pages with this crop*
+brings the ability back, and it deliberately differs from the old
+*Same crop for every page* switch in three ways, each aimed at that switch's
+failure — an edit reaching pages you did not know it would reach:
+
+- it is **off** until you turn it on, and off again every time the app starts;
+- while it is on, the crop frame is **amber and says how many other pages** the
+  edit will reach, on the frame itself rather than in a panel;
+- it reaches only pages whose crop is the **same size** as this one, and
+  applies each edge's movement from each page's own position.
+
+The size rule is what makes it survive straightening. After a crop-all the
+rectangles are identical, but straightening a page moves its crop a few pixels
+to follow the content — matching on the exact rectangle would have dropped
+every straightened page out of the group, which after a crop-all is every page.
+Straightening itself never propagates, since it is about one page's scan.
+
+**A crop stays inside the scan.** Past the edge is scanner bed, or nothing, and
+it is a slip of the hand far more often than an intention: drawing clamps at
+the edge as you drag, and moving an existing crop slides it back in at the same
+size rather than shrinking it. Two things are still allowed out, because both
+are deliberate — holding Shift while drawing, and straightening, which moves
+the crop with the content and must not have its answer clipped underneath it.
+When a locked aspect ratio meets the edge, the clamp shrinks the longer side to
+keep the shape rather than breaking it.
 
 **Fit to page edges** trims a hair inside the paper edge on purpose: a bounding
 box around a slightly skewed sheet always catches wedges of scanner bed in the
@@ -340,6 +425,33 @@ do say something easy to find.
 
 ---
 
+## Blurring
+
+**Pixelate at strength 100, by default.** A blur is placed to make something
+unreadable — a previous owner's name, a price sticker, a serial number — and a
+gentle blur of small text is the failure case: it looks redacted and is not.
+Pixelate at that strength destroys the glyphs rather than softening them, so
+the default is the one you would have picked anyway on the occasion it matters.
+
+**The strength no longer comes from the size of the rectangle.** It used to be
+`min(width, height) * 0.18`, which made a small blur over a serial number
+weaker than a large one over a name — exactly backwards, since the small text
+is the legible part. It is a setting now.
+
+**The controls are at the blur, not in the side panel.** The only question a
+blur raises is whether it is actually illegible, which is a judgement about the
+pixels. So a dialog opens next to the page, and the page redraws behind it as
+the slider moves.
+
+It appears the first time you place a blur in a session and then stays out of
+the way, because a document is redacted the same way throughout and being asked
+on every blur would be worse than a panel. Double-clicking a blur brings it
+back for that one — which is also why the dialog says so the first time it
+opens: a setting you can only reach by a gesture nobody mentioned is a setting
+nobody finds.
+
+---
+
 ## Matching crop sizes
 
 Scans of one document never come out to the same number of pixels: the sheet
@@ -375,12 +487,30 @@ while the aligner went on editing the original pair, so the panel on the right
 described a page that was not on screen and any adjustment made there landed on
 the wrong one.
 
-The queue also keeps its width now. The aligner's control strip is a row of
-group boxes whose combined minimum width used to set the whole pane's minimum,
+The queue also keeps its width now. The aligner's control strip used to be a
+row of group boxes whose combined minimum width set the whole pane's minimum,
 which the splitter then took out of the page grid — squeezing it to a single
 column, and leaving it there after the aligner closed, saved into the next
-session. The strip sits in a scroll area and asks for nothing, and the divider
-positions are restored on the way out.
+session. The divider positions are now restored on the way out, and the strip
+itself asks for very little.
+
+**The strip wraps rather than scrolls.** Putting it in a scroll area fixed the
+width problem and created a worse one: in any window narrower than the whole
+strip, the controls at the right-hand end — Revert, Keep, Join, the
+three ways out of the aligner — were off the edge behind a scrollbar. A control
+you cannot see is one you do not know exists, and these were the ones that
+finish the job.
+
+It is now a flow layout: clusters of related controls wrap onto another line
+when they run out of room, so everything is on screen at every width, and the
+strip's minimum width is its widest single cluster rather than the sum of all
+of them — which is what kept the page grid safe in the first place. The group
+boxes went with it. Four titled frames cost a line of text and eight edges of
+padding to label controls whose own words already said what they did, and that
+padding was most of the reason the strip did not fit. What replaced them is
+icons where the app already uses that icon for the same job elsewhere — the
+guide buttons are the top bar's guide buttons — and short words where it does
+not.
 
 **Link is size only.** Each page keeps its own position over its own scan,
 because a spread is made consistent by making the two pages the same shape, not
@@ -396,6 +526,44 @@ the active page gets first claim on its own edge.
 
 Spread-aligned pages are **locked** afterwards. Their framing was set against
 their facing page, and a crop-all must not come along later and replace it.
+
+**One tool, two endings.** There used to be *Align as spread* and *Join pages
+into one*, two buttons that opened the identical panel and differed only in
+which exit button was the default. Lining up a spread and lining up two passes
+of one sheet are the same work — nudge, rotate, match, guide — so it is one
+tool now, and the choice between **Keep as two pages** and **Join into one
+page** is made at the end, when you can see the result. Keep is the default
+Enter reaches, being the one that changes nothing on disk or in the page count.
+
+### Joined pages are drawn from every scan in them
+
+A joined page's `path` is only its first scan — there is no single file behind
+it. Everything that previews a page used to read `path` anyway: the aligner was
+handed one scan for a two-scan page, which is why joining a joined page thought
+it was the size of a single page, and the book view and the page grid showed the
+first scan stretched across the width of both. The canvas had its own assembly
+code, one level deep, so a join *of* a join showed its inner half the same
+wrong way.
+
+All of it now goes through `render.base_preview`, which assembles a joined page
+from its parts' previews and recurses into parts that are joined themselves,
+and `PageEdit.source_paths()`, which lists every scan underneath however deep.
+The export was never affected — it assembles at full resolution and always
+recursed.
+
+**The aligner draws both pages at one scale.** It lays the two pages out in
+preview pixels, which only means the same thing on both sides if both previews
+are the same fraction of their real size. A joined page broke that: its preview
+is held under the same 2200 px cap as a single scan, so a page twice as wide
+arrived at two-thirds the scale — and was drawn *shorter* than the single page
+it was about to be joined to. The small test scans never reached the cap, so
+every preview sat at scale 1.0 and the mismatch could not show; the tests now
+use scans big enough to be scaled. The aligner brings the sharper preview down
+to the other's scale before laying them out, and a joined page headed for the
+aligner is built at its scans' own resolution rather than squeezed, so in
+practice nothing needs bringing down. The page grid also caches a joined page's picture under the page
+rather than under `path`, which would otherwise have handed the joined picture
+back to its first scan after a split.
 
 ---
 
@@ -455,6 +623,21 @@ reasonable for a large batch. Pages over 30 MP are written tiled so other
 software opens them quickly.
 
 ---
+
+## Dialogs
+
+**The export dialog is two columns.** It was one column six groups tall —
+970 px, more than a laptop screen, so the Export button was off the bottom.
+Left is what you are making and where it goes, with the file preview; right is
+how the page files are written, which is set once and left. Nothing was
+removed. The resolution box shows only the field that means something for the
+chosen mode.
+
+**F1 is a sheet, and it is checked.** It was a message box of plain text that
+had drifted from the app: it still listed D for an auto-deskew that had been
+removed, and gave Delete for two things without saying which was which. It is
+a structured list now, and a test checks it both ways — every shortcut the
+window has is on it, and nothing on it is a key the window no longer has.
 
 ## The build and its self-test
 

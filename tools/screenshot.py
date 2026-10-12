@@ -59,8 +59,8 @@ def main() -> int:
     args = ap.parse_args()
 
     app = QApplication.instance() or QApplication(sys.argv[:1])
-    app.setStyle("Fusion")
-    app.setPalette(dark_palette())
+    from scanforge.ui import theme
+    theme.apply(app)
 
     tmp = tempfile.mkdtemp(prefix="sf_shot_")
     scans = build_scans(os.path.join(tmp, "Sony_KV-16G1"), args.pages)

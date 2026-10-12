@@ -167,8 +167,12 @@ def _dialogs():
     from scanforge.ui.size_match_dialog import SizeMatchDialog
     from scanforge.ui.loading_dialog import QueueLoadDialog
     from scanforge.ui.export_dialog import ExportDialog
+    from scanforge.ui.blur_dialog import BlurDialog, DEFAULT_STRENGTH, DEFAULT_STYLE
     from scanforge.ui.book_view import BookWindow, spreads_for
+    from scanforge.ui.help_dialog import HelpDialog, SECTIONS
+    assert SECTIONS, "the shortcuts sheet is empty"
     assert spreads_for(5) == [(None, 0), (1, 2), (3, 4)]
+    assert (DEFAULT_STYLE, DEFAULT_STRENGTH) == ("Pixelate", 100.0)
     return "lazily-imported dialogs are present"
 
 
@@ -189,8 +193,8 @@ def _qt():
     from scanforge.ui.main_window import MainWindow, dark_palette
     from scanforge.ui import icons
     app = QApplication.instance() or QApplication(sys.argv[:1])
-    app.setStyle("Fusion")
-    app.setPalette(dark_palette())
+    from scanforge.ui import theme
+    theme.apply(app)
     bad = [n for n in icons._DRAW if icons.pixmap(n, 22).isNull()]
     assert not bad, f"icons failed to draw: {bad}"
     win = MainWindow()

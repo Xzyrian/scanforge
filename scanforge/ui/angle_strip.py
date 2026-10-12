@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (QDoubleSpinBox, QHBoxLayout, QLabel, QPushButton,
                                QSlider, QWidget)
 
 from ..model import PageEdit
+from . import theme
 
 # The slider spans a range a scanner actually produces.  A sheet that lands more
 # than a couple of degrees out was put on the glass crooked, and that is a job
@@ -46,7 +47,9 @@ class AngleStrip(QWidget):
         h.setSpacing(8)
 
         lbl = QLabel("Angle")
-        lbl.setStyleSheet("color:#9aa0aa;")
+        theme.hint(lbl)
+        lbl.setToolTip("Straighten the page. [ and ] step by 0.01°, "
+                       "Shift+[ ] by 0.10°")
         h.addWidget(lbl)
 
         self.spin = QDoubleSpinBox()
@@ -60,16 +63,18 @@ class AngleStrip(QWidget):
         self.spin.valueChanged.connect(self._from_spin)
         h.addWidget(self.spin)
 
-        self.btn_zero = QPushButton("0")
-        self.btn_zero.setFixedWidth(30)
-        self.btn_zero.setToolTip("Back to square")
+        # "0" on its own read as a second number box
+        self.btn_zero = QPushButton("0°")
+        self.btn_zero.setFixedWidth(38)
+        self.btn_zero.setToolTip("Back to 0°")
+        theme.compact(self.btn_zero)
         self.btn_zero.clicked.connect(lambda: self.spin.setValue(0.0))
         h.addWidget(self.btn_zero)
 
         left = QLabel(f"−{SPAN:g}°")
         right = QLabel(f"+{SPAN:g}°")
         for t in (left, right):
-            t.setStyleSheet("color:#767c86;font-size:10px;")
+            theme.faint(t)
         h.addSpacing(6)
         h.addWidget(left)
 

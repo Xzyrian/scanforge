@@ -109,18 +109,39 @@ files work too, and dropping a `.sfproj` opens that project. A modal window
 reads every page before you can touch anything, with a real per-page
 percentage.
 
-**2 · Frame the pages.** A page you have not cropped shows a crop window around
-the whole sheet with handles on it, so cropping usually starts by pulling that
-frame in. **Fit to page edges (E)** finds the sheet against the scanner bed and
-does it for you. Two crop tools decide how far a rectangle reaches:
+**2 · Frame the pages.** A page you have not cropped shows no crop and nothing
+dimmed — untouched looks untouched. Two crop tools decide how far a rectangle
+reaches:
 
 * **Crop page (C)** — this page only.
 * **Crop all pages (Shift+C)** — draw once, give it to every page.
 
-Both release themselves after one drag, and neither arms itself: a new project
-opens on the cursor. Per-page settings decide who *receives* a crop-all —
+**Click** with either and you get the whole page as the crop, with handles to
+pull in — which is how most pages get framed. **Drag** to draw a rectangle
+instead. **Fit to page edges (E)** finds the sheet against the scanner bed and
+does it for you.
+
+A crop stays inside the scan: dragging past the edge clamps at it, since a crop
+that reaches past the paper exports scanner bed or nothing. Hold **Shift** while
+drawing for the scan that genuinely needs framing past its own edge;
+straightening is also allowed to carry a crop out, since it moves the crop with
+the content.
+
+Both tools release themselves after one use, and neither arms itself: a new
+project opens on the cursor. Per-page settings decide who *receives* a crop-all —
 **follows** (the default), **keeps its own position** (same size, doesn't move),
 or **locked** (sits out entirely, in both directions).
+
+To adjust the crop across the document afterwards, turn on **Edit all pages
+with this crop (L)**, beside the crop tools. While it is on, any change to this
+page's crop — dragging a handle, the numbers, fit to edges, clearing it — is
+made on every page whose crop is the same size, each from its own position.
+The crop frame turns amber and carries a **+13 pages** badge, so you can always
+see how far an edit is about to reach. It matches on size rather than the exact
+rectangle because straightening moves a page's crop with its content; locked
+pages sit out, and straightening a page never moves anyone else's crop. It is
+off whenever the app starts, and one undo takes back an edit on every page it
+reached.
 
 For crops that are a few pixels apart rather than wrong, **Match crop sizes
 (Ctrl+Shift+M)** brings a group onto one exact size by resizing each about its
@@ -131,7 +152,7 @@ own centre, so the sizes change and the framing does not move.
 * **Guides (Space, Shift+Space)** drop a level or upright cyan line across the
   view. Put it on a baseline or a margin and turn the page onto it.
 * **Auto-deskew (D)** reads the text lines — 0.1° sweep, then 0.01° refinement.
-* **The angle slider** under the canvas spans ±2.000°, so one screen pixel is
+* **The angle slider** in the options bar spans ±2.000°, so one screen pixel is
   about 0.01°. The box beside it takes three decimals directly.
 * **`[` and `]`** rotate 0.01° per press, 0.10° with Shift.
 
@@ -146,23 +167,31 @@ document can be squared against one reference.
   instead of down; **Page ▸ Cut into pages** does measured halves, thirds and
   quarters. You get *n* pages over the same file, each with its own crop.
   Nothing is written to disk.
-* **Join (Ctrl+Shift+J)** is the inverse: a page too big for the platen,
-  scanned in two overlapping passes. Align the two, trim each inner edge, and
-  they become one page that exports as one file. The sources stay separate on
-  disk.
-* **Align as a spread (Ctrl+J)** butts two facing pages together at the gutter
-  in the main work area. Nudge, rotate, match heights, run a guide across both,
-  or **link** the two crop frames so they stay the same size. Nothing is
-  merged — the spread is a viewing aid, and the pages stay two files.
+* **Align or join two pages (Ctrl+J)** butts two pages together in the main
+  work area. Nudge, rotate, match heights, run a guide across both, or **link**
+  the two crop frames so they stay the same size. Then choose how it ends:
+  * **Keep as two pages** — a spread. Each page keeps the framing you set, the
+    two are recorded as a pair, and they stay two files.
+  * **Join into one page** — one sheet too big for the platen, scanned in two
+    overlapping passes. Trim each inner edge first and they become one page
+    that exports as one file. A joined page can be joined again, and
+    **Page ▸ Split a joined page apart** takes it back. The scans on disk are
+    never touched either way.
 
 Cut pieces, joined pages and spread-aligned pages are **locked** automatically,
 so a later crop-all cannot undo work you did by hand.
 
 **5 · Blur what shouldn't ship.** **B** and drag over a previous owner's name, a
-price sticker, a serial number. What you see is a real blur of the actual
-pixels, not a grey box standing in for one, so you can tell whether it's strong
-enough before you export. Blur or pixelate, adjustable strength, as many per
-page as you like.
+price sticker, a serial number. New blurs are **pixelate at strength 100**,
+which is the setting that actually destroys the text rather than softening it.
+
+The first blur you place opens a small dialog for the style and strength, and
+the page redraws behind it as you move the slider — what you see is a real blur
+of the actual pixels, not a grey box standing in for one, so you can tell
+whether it is strong enough before you export. Every blur after that reuses
+those settings, since a document is usually redacted the same way throughout;
+**double-click a blur** to change that one. Move and resize them freely, as
+many per page as you like.
 
 **6 · Put them in order.** Raw scans rarely come off the scanner in reading
 order, so the grid is editable: drag to reorder (the pages lift out and a slot
@@ -206,43 +235,51 @@ page files as well** when you want them.
 ## The window
 
 ```
- ┌─────────────────────────────────────────────────────────────┐
- │  open save save-as export │ undo redo │ guides │ grid book  │
- ├──────┬───────────────────────────────────┬──────────────────┤
- │      │                                   │                  │
- │ tool │          the scan                 │   page grid      │
- │ col  │                                   │                  │
- │      ├───────────────────────────────────┼──────────────────┤
- │      │  angle  0.000°  0  ──────●──────  │   crop numbers   │
- │      │                                   │   and framing    │
- ├──────┴───────────────────────────────────┴──────────────────┤
- │  status · page 3 of 240 · x,y · [fit] ────●──── 61%         │
- └─────────────────────────────────────────────────────────────┘
+ ┌─────────────────────────────────────────────────────────────────┐
+ │  open save save-as export │ undo redo │ guides │ grid book      │
+ ├──────┬────────────────────────────────────────┬─────────────────┤
+ │      │ Crop X Y W H  → size  Aspect  This page│                 │
+ │ tool │ Angle 0.000° [0°] ─────────●─────────  │   page grid     │
+ │ col  ├────────────────────────────────────────┤                 │
+ │      │                                        │                 │
+ │      │               the scan                 │                 │
+ │      │                                        │                 │
+ ├──────┴────────────────────────────────────────┴─────────────────┤
+ │  what a button does  ·  page_0003.tif · 600 dpi · 3 of 240 · 61% │
+ └─────────────────────────────────────────────────────────────────┘
 ```
 
-Left to right in the order the work flows. The **top bar** is the document and
-the view — open, save, export, undo, guides, grid, book — and nothing in it
-changes a page. The **tool column** is everything that acts on the page, so it
-sits beside the page: four tools (cursor, crop page, crop all, blur, cut), then
-orientation, then framing that reaches past this page, then the automatic pass,
-then *done*. The **page grid** is on the right, where you look to see where you
-are in the document rather than what you are doing to one sheet of it. The
-**status bar** carries the zoom slider and a fit button.
+Left to right in the order the work flows.
 
-The panel under the page grid is a holding position: the crop numbers, reuse
-buttons and blur controls have not been given permanent homes yet.
+- **Top bar** — the document and the view: open, save, export, undo, guides,
+  grid, book. Nothing in it changes a page.
+- **Tool column** — everything that acts on the page, beside the page. Hover
+  for a tool's name and key; the bar at the bottom of the window says what it
+  does.
+- **Options bar** — the numbers for the page in front of you: the crop in
+  source pixels and what it exports as, the aspect lock, what crop-all does to
+  this page, the angle, and — while one is selected — the blur's settings.
+- **Page grid** — the whole right-hand column: where you are in the document,
+  and where you put pages in order.
+- **Status bar** — what the button under the mouse does, which page this is
+  and what it is made of, and the zoom.
+
+With nothing open, the window shows a start screen instead: open a folder,
+open a project, or pick one of the recent projects. **File ▸ Open recent** has
+the same list.
 
 ---
 
 ## Keyboard reference
 
-Press **F1** in the app for this list.
+Press **F1** in the app for the full sheet.
 
 ```
 TOOLS
   V                   cursor - pan, zoom, adjust an existing crop or blur
   C                   crop this page - one drag, then it releases
   Shift+C             crop every page in the project
+  L                   edit all pages with this crop (toggle)
   B                   blur - drag out a blur over something on the page
   X                   cut - split this scan into separate pages
   Del                 delete the selected blur
@@ -273,7 +310,7 @@ CROPPING
 CUTTING AND JOINING
   X                   place a cut line - Shift cuts across instead of down
   Page > Cut          measured cuts: halves, thirds, quarters
-  Ctrl+Shift+J        join two scans into a single page
+  Ctrl+J              align or join two pages
 
 QUEUE
   Delete              remove selected pages (files on disk are untouched)
@@ -286,7 +323,6 @@ BATCH
   Ctrl+B              copy framing from previous page
   Ctrl+Shift+B        apply this framing to selected pages
   Ctrl+G              set the document name
-  Ctrl+J              align two pages as a spread
   Ctrl+Shift+M        match crops within a few pixels of each other
   Ctrl+E              export
 
@@ -345,8 +381,12 @@ scanforge/
     icons.py       every icon and the app mark, drawn from code - no assets
     loader.py      background decoding and one-off worker tasks
     canvas.py      the editing canvas, the tools, the guides
-    angle_strip.py the straightening strip under the canvas
-    inspector.py   the crop numbers and framing controls
+    options_bar.py the numbers for the page in front of you, above it
+    angle_strip.py the angle slider, box and reset, inside the options bar
+    welcome.py     what the window shows with nothing open
+    help_dialog.py the F1 sheet - checked against the real shortcuts
+    theme.py       every colour, and the one style sheet built from them
+    widgets.py     small shared pieces: the wrapping flow layout and friends
     queue_panel.py the page grid
     spread_view.py facing-page alignment, in the work area
     book_view.py   read the finished pages two at a time

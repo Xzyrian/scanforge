@@ -185,6 +185,9 @@ class QueueLoadDialog(QDialog):
         self.list.setFocusPolicy(Qt.NoFocus)
         self.list.setUniformItemSizes(True)
         self.list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        # the rows are drawn to the list's width, so there is nothing to
+        # scroll sideways to - the bar was a stray, not a feature
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.delegate = _RowDelegate(self.list)
         self.list.setItemDelegate(self.delegate)
         self.list.setStyleSheet(

@@ -22,6 +22,8 @@ from PySide6.QtWidgets import QGraphicsScene, QGraphicsView
 from ..geometry import (Rect, apply_affine, invert_affine, rotation_matrix,
                         rotated_size)
 from ..model import PageEdit
+from .blur_dialog import DEFAULT_STRENGTH as DEFAULT_BLUR_STRENGTH
+from .blur_dialog import DEFAULT_STYLE as DEFAULT_BLUR_STYLE
 
 HANDLE_PX = 9.0
 EDGE_PX = 7.0
@@ -31,6 +33,9 @@ EDGE_PX = 7.0
 # measuring aid you cannot see is worse than none, because you think you
 # checked.  Named rather than inlined so it can be measured.
 GRID_PEN = (QColor(0, 255, 200, 110), 2.0)
+
+# The crop frame's colour while an edit to it will also change other pages.
+LINKED_FRAME = QColor(255, 194, 71)
 
 
 class Tool(str, Enum):
@@ -118,6 +123,8 @@ class Canvas(QGraphicsView):
     cropDrawn = Signal(bool)             # a crop was drawn; True = every page
     pageChanged = Signal()               # a page arrived, or the canvas emptied
     filesDropped = Signal(list)          # scans or a project dropped on the page
+    blurPlaced = Signal(int)             # a new blur was just drawn
+    blurConfigure = Signal(int)          # open the blur settings for this one
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -138,6 +145,10 @@ class Canvas(QGraphicsView):
         self._proxy_arr: Optional[np.ndarray] = None   # kept for blur previews
         self._blur_pix: dict = {}        # (mode, radius bucket) -> QPixmap
         self.blur_selected: int = -1     # index into edit.blurs
+        # What the next blur gets.  Set once from the dialog and then reused,
+        # because a document is usually redacted the same way throughout.
+        self.blur_style = DEFAULT_BLUR_STYLE
+        self.blur_strength = DEFAULT_BLUR_STRENGTH
         self._ref_size = (1, 1)          # proxy dimensions = scene reference
         self._scale = 1.0                # proxy px per full-res px
 
@@ -148,6 +159,10 @@ class Canvas(QGraphicsView):
         self.guides_h: list = []         # scene y
         self.guides_v: list = []         # scene x
         self.lock_aspect: Optional[float] = None
+        # Other pages a crop edit here will also change, when "edit every page
+        # with this crop" is on.  Drawn on the frame itself, so an edit that
+        # reaches past this page can never look like one that does not.
+        self.linked_count = 0
 
         self._drag = None                # (kind, data)
         self._cut = None                 # (axis, scene position) while placing
@@ -250,11 +265,18 @@ class Canvas(QGraphicsView):
         self.viewport().update()
 
     def add_blur(self, rect: QRectF) -> int:
+        """Place a blur using the settings the last one was given.
+
+        The strength used to be derived from the size of the rectangle, which
+        meant a small blur over a serial number was weaker than a large one
+        over a name - the opposite of what you want, since the small text is
+        the legible part. It is a fixed setting now, asked for once.
+        """
         s = self._scale or 1.0
         r = rect.normalized()
         w, h = max(8.0, r.width() / s), max(8.0, r.height() / s)
-        radius = max(4.0, min(w, h) * 0.18)
-        self.edit.blurs.append([r.x() / s, r.y() / s, w, h, radius, "Blur"])
+        self.edit.blurs.append([r.x() / s, r.y() / s, w, h,
+                                float(self.blur_strength), self.blur_style])
         self.blur_selected = len(self.edit.blurs) - 1
         return self.blur_selected
 
@@ -311,6 +333,38 @@ class Canvas(QGraphicsView):
             return QRectF(0, 0, W, H)
         r = self.edit.crop_rect().scaled(self._scale)
         return QRectF(r.x, r.y, r.w, r.h)
+
+    def confine_crop(self, rect: QRectF, how: str = "clip") -> QRectF:
+        """Keep a crop inside the scan.
+
+        A crop that reaches past the edge of the scan exports scanner bed, or
+        nothing at all - it is almost always a slip of the hand rather than an
+        intention. Two things are still allowed out: drawing with Shift held,
+        for the rare scan that genuinely needs framing past its own edge, and
+        straightening, which moves the crop with the content and must not have
+        its answer clipped underneath it.
+
+        `how` is "move" to slide the rectangle back inside without changing its
+        size, and "clip" to cut it at the edge.
+        """
+        W, H = self.page_canvas()
+        r = QRectF(rect).normalized()
+        if how == "move":
+            r.moveTo(min(max(r.x(), 0.0), max(0.0, W - r.width())),
+                     min(max(r.y(), 0.0), max(0.0, H - r.height())))
+            return r
+        clipped = r.intersected(QRectF(0.0, 0.0, W, H))
+        if clipped.isEmpty():
+            return QRectF(min(max(r.x(), 0.0), W), min(max(r.y(), 0.0), H), 0.0, 0.0)
+        ratio = self.lock_aspect
+        if ratio and clipped.height() > 0:
+            # clipping breaks a locked ratio, so put it back by shrinking the
+            # side that is now too long - still inside, still the right shape
+            if clipped.width() / clipped.height() > ratio:
+                clipped.setWidth(clipped.height() * ratio)
+            else:
+                clipped.setHeight(clipped.width() / ratio)
+        return clipped
 
     def set_crop_scene(self, rect: QRectF, commit: bool = True) -> None:
         if self.edit is None:
@@ -491,15 +545,25 @@ class Canvas(QGraphicsView):
         painter.setPen(QPen(QColor(120, 125, 135), px))
         painter.drawRect(QRectF(0, 0, W, H))
 
-        # crop frame + handles
-        painter.setPen(QPen(QColor(255, 255, 255, 230), px * 1.6))
-        painter.drawRect(crop)
-        if self.tool in (Tool.CURSOR, Tool.CROP):
-            hs = HANDLE_PX * px
-            painter.setBrush(QBrush(QColor(255, 255, 255)))
-            painter.setPen(QPen(QColor(30, 30, 30), px))
-            for cx, cy in self._handle_points(crop):
-                painter.drawRect(QRectF(cx - hs / 2, cy - hs / 2, hs, hs))
+        # Crop frame + handles - only when there is a crop.  A page nobody has
+        # cropped used to be drawn with a frame around the whole sheet, which
+        # is indistinguishable from a full-page crop somebody chose, and made
+        # "no crop yet" and "cropped to the edges" look identical.  Nothing is
+        # dimmed either, so an untouched page just looks untouched.  Click with
+        # the crop tool and the whole page becomes the crop, handles and all.
+        if self.edit.crop is not None:
+            linked = self.linked_count > 0
+            painter.setPen(QPen(LINKED_FRAME if linked
+                                else QColor(255, 255, 255, 230), px * 1.6))
+            painter.drawRect(crop)
+            if linked:
+                self._draw_linked_badge(painter, crop)
+            if self.tool in (Tool.CURSOR, Tool.CROP):
+                hs = HANDLE_PX * px
+                painter.setBrush(QBrush(QColor(255, 255, 255)))
+                painter.setPen(QPen(QColor(30, 30, 30), px))
+                for cx, cy in self._handle_points(crop):
+                    painter.drawRect(QRectF(cx - hs / 2, cy - hs / 2, hs, hs))
 
         # blur outlines, so an obscured spot is still findable and adjustable
         for i, b in enumerate(self.edit.blurs or []):
@@ -517,6 +581,31 @@ class Canvas(QGraphicsView):
                     painter.drawRect(QRectF(cx - hs / 2, cy - hs / 2, hs, hs))
 
         self._draw_cut(painter, crop, px)
+
+    def _draw_linked_badge(self, painter: QPainter, crop: QRectF) -> None:
+        """"+13 pages" on the crop frame, in screen pixels at any zoom."""
+        n = self.linked_count
+        text = f"+{n} page" + ("" if n == 1 else "s")
+        corner = self.mapFromScene(crop.topLeft())
+        painter.save()
+        painter.resetTransform()
+        f = painter.font()
+        f.setPointSizeF(9.0)
+        f.setBold(True)
+        painter.setFont(f)
+        fm = painter.fontMetrics()
+        w, h = fm.horizontalAdvance(text) + 12, fm.height() + 4
+        x = max(2, corner.x())
+        y = corner.y() - h - 3
+        if y < 2:                                  # frame at the top: go inside
+            y = corner.y() + 3
+        r = QRectF(x, y, w, h)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(LINKED_FRAME)
+        painter.drawRoundedRect(r, 3, 3)
+        painter.setPen(QColor(30, 26, 12))
+        painter.drawText(r, Qt.AlignCenter, text)
+        painter.restore()
 
     def _draw_cut(self, painter: QPainter, crop: QRectF, px: float) -> None:
         if self._cut is None:
@@ -561,12 +650,13 @@ class Canvas(QGraphicsView):
 
     def _hit(self, scene_pos: QPointF):
         crop = self.crop_scene()
-        # A page with no crop of its own still shows a crop window - the whole
-        # sheet - and its edges are draggable, because that is how cropping a
-        # scan starts: pull the frame in from the edges.  What such a page must
-        # *not* offer is "move", which would claim every click on the page and
-        # leave the crop tool no way to draw a fresh rectangle inside it.
+        # Nothing on a page with no crop is grabbable: there is no frame drawn,
+        # and offering invisible handles around the sheet meant a click near
+        # the edge silently created a full-page crop nobody asked for.  The
+        # crop tool is how a page gets its first crop.
         blank = self.edit is not None and self.edit.crop is None
+        if blank:
+            return None, None
         px = 1.0 / (self.view_scale() or 1.0)
         tol = HANDLE_PX * px
         for i, (hx, hy) in enumerate(self._handle_points(crop)):
@@ -692,7 +782,9 @@ class Canvas(QGraphicsView):
                 self.setCursor(Qt.SplitHCursor)
             elif kind == "move":
                 self.setCursor(Qt.SizeAllCursor)
-            elif self.tool == Tool.CROP:
+            elif self.tool in (Tool.CROP, Tool.CROP_ALL):
+                # crop-all draws exactly the same rectangle as crop-page; it
+                # was left out here and fell through to the hand cursor
                 self.setCursor(Qt.CrossCursor)
             else:
                 self.setCursor(Qt.OpenHandCursor)
@@ -747,20 +839,43 @@ class Canvas(QGraphicsView):
             return
         if kind == "new":
             start, _previous = data
-            self.set_crop_scene(QRectF(start, pos), commit=False)
+            r = QRectF(start, pos)
+            # Shift while drawing is the way out of the scan area
+            if not (ev.modifiers() & Qt.ShiftModifier):
+                r = self.confine_crop(r)
+            self.set_crop_scene(r, commit=False)
             return
         if kind == "move":
             start, orig = data
             d = pos - start
             r = QRectF(orig)
             r.translate(d)
-            self.set_crop_scene(r, commit=False)
+            self.set_crop_scene(self.confine_crop(r, "move"), commit=False)
             return
         if kind == "resize":
             handle, orig, start = data
-            self.set_crop_scene(self._resized(handle, orig, pos, ev.modifiers()),
-                                commit=False)
+            r = self._resized(handle, orig, pos, ev.modifiers())
+            self.set_crop_scene(self.confine_crop(r), commit=False)
             return
+
+    def mouseDoubleClickEvent(self, ev):
+        """Double-click a blur to change how it looks.
+
+        The style and strength are not in the side panel any more, so this is
+        how you get back to them - which is also why the dialog says so the
+        first time it opens.
+        """
+        if self.edit is not None and ev.button() == Qt.LeftButton:
+            pos = self.mapToScene(ev.position().toPoint())
+            i, _handle = self._hit_blur(pos)
+            if i >= 0:
+                self.blur_selected = i
+                self.blurSelected.emit(i)
+                self.viewport().update()
+                self.blurConfigure.emit(i)
+                ev.accept()
+                return
+        super().mouseDoubleClickEvent(ev)
 
     def mouseReleaseEvent(self, ev):
         if self._drag is None:
@@ -787,18 +902,19 @@ class Canvas(QGraphicsView):
             r = self.crop_scene()
             px = 1.0 / (self.view_scale() or 1.0)
             if r.width() < 10 * px or r.height() < 10 * px:
-                # a click, not a drag: put back whatever was there
-                _start, previous = self._drag_data
-                self.edit.crop = list(previous) if previous else None
-                self.statusBar_hint = True
+                # A click, not a drag: take the whole page, so cropping starts
+                # from a frame you pull in rather than from nothing. That is
+                # how most pages actually get cropped, and it used to need a
+                # drag from one corner of the scan to the other to set up.
+                W, H = self.page_canvas()
+                self.set_crop_scene(QRectF(0.0, 0.0, W, H), commit=False)
                 self.statusMessage.emit(
-                    "Drag out a rectangle to crop — a single click does nothing")
-            else:
-                # one crop per arming, so a stray drag cannot overwrite it
-                to_all = getattr(self, "_drew_for_all", False)
-                self.tool = Tool.CURSOR
-                self.toolFinished.emit()
-                self.cropDrawn.emit(bool(to_all))
+                    "Whole page — drag the handles to bring the crop in")
+            # one crop per arming, so a stray drag cannot overwrite it
+            to_all = getattr(self, "_drew_for_all", False)
+            self.tool = Tool.CURSOR
+            self.toolFinished.emit()
+            self.cropDrawn.emit(bool(to_all))
             self._drew_for_all = False
             end_group = True
         elif kind == "blur_new":
@@ -810,11 +926,11 @@ class Canvas(QGraphicsView):
                 b = self.edit.blurs[i]
                 b[0], b[1] = b[0] - side / 2, b[1] - side / 2
                 b[2] = b[3] = side
-                b[4] = side * 0.18
             self.tool = Tool.CURSOR
             self.toolFinished.emit()
             end_group = True
             self.blurSelected.emit(self.blur_selected)
+            self.blurPlaced.emit(self.blur_selected)
         elif kind in ("move", "resize", "blur_move", "blur_resize"):
             end_group = True
 

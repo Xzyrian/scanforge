@@ -126,15 +126,19 @@ class PageEdit:
         so the label is what tells them apart."""
         return f"{self.name} · {self.label}" if self.label else self.name
 
+    def raw_size(self) -> tuple[int, int]:
+        """The page's image before any 90-degree turn: what a proxy of it is
+        stored as. For a joined page that is the assembled image."""
+        if self.join:
+            return join_size(self.join)
+        return self.src_w, self.src_h
+
     def base_size(self) -> tuple[int, int]:
         """Size of the frame the angle and crop are measured against.
 
         For a joined page that is the assembled image, not any one source file.
         """
-        if self.join:
-            w, h = join_size(self.join)
-        else:
-            w, h = self.src_w, self.src_h
+        w, h = self.raw_size()
         if self.quadrant % 2:
             return h, w
         return w, h
@@ -256,6 +260,21 @@ class PageEdit:
 
     def parts(self) -> list:
         return [PageEdit.from_dict(d) for d in (self.join or {}).get("parts", [])]
+
+    def source_paths(self) -> list:
+        """Every scan this page is drawn from, however deeply it was joined.
+
+        `path` alone is not enough for a joined page: it is only the first
+        scan, and a join of a join has scans that no single level lists.
+        """
+        if not self.join:
+            return [self.path]
+        out = []
+        for part in self.parts():
+            for p in part.source_paths():
+                if p not in out:
+                    out.append(p)
+        return out
 
     def unjoin(self) -> list:
         """Take a joined page back apart into the pages it was made from."""

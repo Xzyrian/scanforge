@@ -13,16 +13,15 @@ def main() -> int:
     from PySide6.QtCore import Qt
     from PySide6.QtWidgets import QApplication
 
-    from .ui.main_window import MainWindow, dark_palette
-    from .ui import icons
+    from .ui.main_window import MainWindow
+    from .ui import icons, theme
 
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
     app.setApplicationName("ScanForge")
     app.setOrganizationName("ScanForge")
-    app.setStyle("Fusion")
-    app.setPalette(dark_palette())
+    theme.apply(app)
     app.setWindowIcon(icons.app_icon())
 
     win = MainWindow()

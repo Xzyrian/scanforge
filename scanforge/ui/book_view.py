@@ -31,6 +31,7 @@ from .. import proxycache, render as rnd
 from ..model import PageEdit, Project
 from .canvas import numpy_to_pixmap
 from .loader import Background
+from . import theme
 
 PAPER = QColor(250, 250, 248)
 DESK = QColor(26, 27, 30)
@@ -127,18 +128,25 @@ class BookView(QWidget):
         if got is not None and got[1] == want and got[2] == self._stamp(page):
             return got[0]
 
-        arr = proxycache.load(page.path, want, build_if_missing=False)
+        # base_preview, not proxycache: a joined page's `path` is only its
+        # first scan, and reading that stretched it across the whole joined
+        # width.  It assembles joins (of joins) from their scans.
+        arr = rnd.base_preview(page, want)
         tier = want
         if arr is None:
-            arr = proxycache.load(page.path, "proxy", build_if_missing=False)
+            arr = rnd.base_preview(page, "proxy")
             tier = "proxy"
             if want == "detail" and page.uid not in self._detail_wanted:
                 self._detail_wanted.add(page.uid)
-                self.needDetail.emit(page.path)
+                for path in page.source_paths():
+                    self.needDetail.emit(path)
         if arr is None:
             return None
-        bw, _bh = page.base_size()
-        scale = arr.shape[1] / float(bw) if bw else 1.0
+        # The preview is stored unrotated, so its scale has to be measured
+        # against the unrotated width.  base_size() is the width *after* a
+        # 90-degree turn, which gave a turned page the wrong scale.
+        rw, _rh = page.raw_size()
+        scale = arr.shape[1] / float(rw) if rw else 1.0
         try:
             out = rnd.render(page, arr, interp="linear", source_scale=scale)
         except Exception:                              # noqa: BLE001
@@ -568,7 +576,7 @@ class BookWindow(QDialog):
         self.slider.valueChanged.connect(
             lambda v: self.view.go(v, animate=False))
         self.lbl = QLabel("")
-        self.lbl.setStyleSheet("color:#9aa0aa;")
+        theme.hint(self.lbl)
         self.lbl.setMinimumWidth(150)
 
         self.chk_cover = QCheckBox("First page is a cover")

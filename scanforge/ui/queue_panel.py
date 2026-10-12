@@ -21,10 +21,12 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox,
                                QPushButton, QStyle, QStyledItemDelegate,
                                QToolButton, QVBoxLayout, QWidget)
 
-from .. import proxycache
+from .. import proxycache, render as rnd
 from ..imageio_util import RASTER_EXTS
 from ..model import PageEdit, Project
 from . import icons
+from .canvas import numpy_to_pixmap
+from . import theme
 
 _ICON_ROLE = Qt.UserRole + 3      # this row's picture is current
 _GAP_ROLE = Qt.UserRole + 4       # this row is the slot being dragged to
@@ -74,7 +76,7 @@ class MoveToDialog(QDialog):
         v.addWidget(self.edit)
 
         self.note = QLabel(f"currently {current} of {count}")
-        self.note.setStyleSheet("color:#9aa0aa;")
+        theme.hint(self.note)
         v.addWidget(self.note)
 
         self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -245,6 +247,7 @@ class PageList(QListWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.empty_text = "Your pages appear here.\n\nDrag them to put them in order."
         self._press_pos: Optional[QPoint] = None
         self._press_row = -1
         self._drag_uids: list = []
@@ -488,6 +491,15 @@ class PageList(QListWidget):
 
     def paintEvent(self, ev):
         super().paintEvent(ev)
+        if self.count() == 0 and not self.dragging:
+            # an empty grid says what it is for, rather than being a dark box
+            p = QPainter(self.viewport())
+            p.setPen(QColor("#767c86"))
+            p.drawText(self.viewport().rect().adjusted(16, 0, -16, 0),
+                       Qt.AlignCenter | Qt.TextWordWrap,
+                       self.empty_text)
+            p.end()
+            return
         if self._ghost is None or self._ghost_at is None:
             return
         p = QPainter(self.viewport())
@@ -574,8 +586,8 @@ class QueuePanel(QWidget):
     setDocumentRequested = Signal()
     doneToggleRequested = Signal()
     spreadRequested = Signal()
-    joinRequested = Signal()
     unjoinRequested = Signal()
+    rebuilt = Signal()                   # the list was filled again
 
     def __init__(self, project: Project, prefetcher: proxycache.Prefetcher, parent=None):
         super().__init__(parent)
@@ -682,7 +694,7 @@ class QueuePanel(QWidget):
         root.addLayout(tools)
 
         self.lbl_count = QLabel("0 pages")
-        self.lbl_count.setStyleSheet("color:#9aa0aa;")
+        theme.hint(self.lbl_count)
         self.lbl_count.setWordWrap(True)
         root.addWidget(self.lbl_count)
 
@@ -722,7 +734,15 @@ class QueuePanel(QWidget):
         # off the widget would find nothing and silently do nothing at all.
         moving = sorted(picked, key=lambda u: self.project.index_of(u))
         moving = [u for u in moving if self.project.by_uid(u) is not None]
+        # Every path from here rebuilds the list, including the ones that
+        # change nothing.  Starting a drag physically removes the dragged rows
+        # from the widget, so a return that skips the rebuild leaves the page
+        # missing from the grid while it is still perfectly present in the
+        # project - the count stays right and the positions skip a number.
+        # Dropping a page back where it came from does exactly that, which is
+        # the most ordinary thing to do after picking one up by accident.
         if not moving:
+            self.rebuild(self.current_uid())
             return
         rest = [u for u in self.visible_uids() if u not in picked]
         at = max(0, min(len(rest), row))
@@ -732,6 +752,7 @@ class QueuePanel(QWidget):
         involved = set(new_order)
         current = [p.uid for p in self.project.pages if p.uid in involved]
         if new_order == current:
+            self._reselect(moving)
             return
         self.orderChanged.emit("Reorder pages")
         self.project.reorder_visible(new_order)
@@ -787,11 +808,8 @@ class QueuePanel(QWidget):
         m = QMenu(self)
         a_doc = m.addAction(icons.icon("save_as", 16), "Set document name…")
         a_doc.triggered.connect(self.setDocumentRequested.emit)
-        a_spread = m.addAction(icons.icon("spread", 16), "Align as spread…")
+        a_spread = m.addAction(icons.icon("spread", 16), "Align or join two pages…")
         a_spread.triggered.connect(self.spreadRequested.emit)
-        a_join = m.addAction(icons.icon("spread", 16), "Join into one page…")
-        a_join.triggered.connect(self.joinRequested.emit)
-        a_join.setEnabled(len(uids) >= 2)
         pages = [self.project.by_uid(u) for u in uids]
         a_unjoin = m.addAction("Split joined page apart")
         a_unjoin.triggered.connect(self.unjoinRequested.emit)
@@ -828,7 +846,6 @@ class QueuePanel(QWidget):
                   a_show):
             a.setEnabled(bool(uids))
         if not uids:
-            a_join.setEnabled(False)
             a_unjoin.setEnabled(False)
         m.exec(self.list.mapToGlobal(pos))
 
@@ -894,6 +911,7 @@ class QueuePanel(QWidget):
         if keep_uid:
             self.select(keep_uid)
         self._icon_timer.start()
+        self.rebuilt.emit()
 
     # -------------------------------------------------------- lazy thumbnails
     def _visible_rows(self) -> tuple:
@@ -1050,27 +1068,52 @@ class QueuePanel(QWidget):
         stays cacheable across reordering and marking done - which used to
         throw the cached picture away and decode the JPEG again.
         """
-        key = (page.path, self._state_key(page))
+        pk = self._pix_key(page)
+        key = (pk, self._state_key(page))
         cached = self._icons.get(key)
         if cached is not None:
             return cached
 
-        base = self._base_pix.get(page.path)
-        if base is None:
+        base = self._base_pix.get(pk)
+        if base is None and page.join:
+            # assembled from its scans' thumbnails - its `path` is only the
+            # first scan, which is all this used to show
+            try:
+                arr = rnd.base_preview(page, "thumb")
+            except Exception:                              # noqa: BLE001
+                arr = None
+            if arr is not None:
+                base = numpy_to_pixmap(arr).scaled(
+                    THUMB_W, THUMB_H, Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation)
+                self._base_pix[pk] = base
+        elif base is None:
             f = proxycache._cache_file(page.path, "thumb")
             if os.path.exists(f):
                 pm = QPixmap(f)
                 if not pm.isNull():
                     base = pm.scaled(THUMB_W, THUMB_H, Qt.KeepAspectRatio,
                                      Qt.SmoothTransformation)
-                    self._base_pix[page.path] = base
+                    self._base_pix[pk] = base
         if base is None:
-            self.prefetcher.request(page.path, tiers=("thumb",))
+            for path in page.source_paths():
+                self.prefetcher.request(path, tiers=("thumb",))
             return self._placeholder()
 
         pm = self._centred(self._framed(base, page))
         self._icons[key] = pm
         return pm
+
+    @staticmethod
+    def _pix_key(page: PageEdit) -> str:
+        """What a page's picture is cached under.
+
+        The file path for an ordinary page - the halves of a cut scan share one
+        picture, which is right. Not for a joined page: its `path` is its
+        first scan, so keying it by path handed it that scan's picture, and
+        would hand the scan the joined page's picture after a split.
+        """
+        return f"join:{page.uid}" if page.join else page.path
 
     @staticmethod
     def _framed(base: QPixmap, page: PageEdit) -> QPixmap:
@@ -1127,13 +1170,18 @@ class QueuePanel(QWidget):
         just marked stale and the filler picks it up if it is on screen.
         """
         self._base_pix.pop(path, None)
+        # Every page drawn from this scan: both halves of a cut (this used to
+        # stop at the first), and any joined page that has it as a part.
         for page in self.project.pages:
-            if page.path == path:
-                item = self._items.get(page.uid)
-                if item is not None:
-                    item.setData(_ICON_ROLE, None)
-                    self._icon_timer.start()
-                return
+            if path not in page.source_paths():
+                continue
+            pk = self._pix_key(page)
+            self._base_pix.pop(pk, None)
+            self._icons = {k: v for k, v in self._icons.items() if k[0] != pk}
+            item = self._items.get(page.uid)
+            if item is not None:
+                item.setData(_ICON_ROLE, None)
+                self._icon_timer.start()
 
     def refresh_item(self, uid: str) -> None:
         page = self.project.by_uid(uid)
@@ -1257,16 +1305,20 @@ class QueuePanel(QWidget):
             self._base_pix.clear()
             self._icons.clear()
         else:
-            for p in paths:
+            gone = set(paths)
+            # a joined page's picture is built from these scans too
+            gone |= {self._pix_key(pg) for pg in self.project.pages
+                     if pg.join and gone & set(pg.source_paths())}
+            for p in gone:
                 self._base_pix.pop(p, None)
             self._icons = {k: v for k, v in self._icons.items()
-                           if k[0] not in set(paths)}
+                           if k[0] not in gone}
         self._invalidate_icons()
 
     def drop_stale_icons(self) -> None:
         """Forget decorated icons for pages that no longer exist, keeping the
         decoded thumbnails themselves."""
-        live = {p.path for p in self.project.pages}
+        live = {self._pix_key(p) for p in self.project.pages}
         self._icons = {k: v for k, v in self._icons.items() if k[0] in live}
         self._base_pix = {k: v for k, v in self._base_pix.items()
                           if k in live or k == "__placeholder__"}

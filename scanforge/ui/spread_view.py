@@ -13,14 +13,16 @@ import math
 from typing import Optional
 
 import numpy as np
-from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import (QPoint, QPointF, QRect, QRectF, QSize, Qt, Signal)
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import (QCheckBox, QDoubleSpinBox, QGroupBox,
-                               QHBoxLayout, QLabel, QPushButton, QScrollArea,
-                               QSpinBox, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QCheckBox, QDoubleSpinBox, QHBoxLayout,
+                               QLabel, QLayout, QPushButton, QSizePolicy,
+                               QSpinBox, QToolButton, QVBoxLayout, QWidget)
 
 from ..geometry import rotation_matrix, rotated_size
 from ..model import PageEdit
+from . import icons, theme
+from .widgets import FlowLayout, _cluster, _sep, _tool
 from .canvas import numpy_to_pixmap, qtransform_from_affine, remap_crop_for_angle
 
 HANDLE_PX = 9.0                      # drawn size and grab tolerance, screen px
@@ -67,9 +69,33 @@ class SpreadView(QWidget):
     def set_pages(self, left: PageEdit, right: PageEdit,
                   left_proxy: np.ndarray, right_proxy: np.ndarray) -> None:
         self.left, self.right = left, right
+        # Both pages have to be drawn at ONE scale.  The view lays them out in
+        # preview pixels, which only means the same thing on both sides if both
+        # previews are the same fraction of their real size - and they are not
+        # when one is a joined page: its preview is squeezed under the same
+        # 2200 px cap as a single scan, so a page twice as wide came out at a
+        # smaller scale, and was drawn shorter than the single page beside it.
+        # So bring the sharper one down to the other's scale.  Downscaling only:
+        # scaling up would invent detail the preview does not have.
+        pms, scales = {}, {}
         for side, edit, proxy in (("left", left, left_proxy),
                                   ("right", right, right_proxy)):
             pm = numpy_to_pixmap(proxy)
+            bw, _bh = edit.base_size()
+            pms[side] = pm
+            scales[side] = pm.width() / float(bw) if bw else 1.0
+        common = min(scales.values())
+        for side in pms:
+            if scales[side] > common * 1.0005:
+                f = common / scales[side]
+                pm = pms[side]
+                pms[side] = pm.scaled(max(1, round(pm.width() * f)),
+                                      max(1, round(pm.height() * f)),
+                                      Qt.IgnoreAspectRatio,
+                                      Qt.SmoothTransformation)
+
+        for side, edit in (("left", left), ("right", right)):
+            pm = pms[side]
             self._pix[side] = pm
             self._ref[side] = (pm.width(), pm.height())
             bw, _bh = edit.base_size()
@@ -428,6 +454,11 @@ class SpreadView(QWidget):
         elif k == Qt.Key_BracketRight:
             self.rotate_active(0.01 if not (ev.modifiers() & Qt.ShiftModifier) else 0.1)
             return
+        elif k == Qt.Key_Space:
+            # the same key as on the editing canvas, for the same job: judging
+            # one page and judging two facing pages is the same task
+            self.add_guide(not (ev.modifiers() & Qt.ShiftModifier))
+            return
         elif k == Qt.Key_Tab:
             self.active = "right" if self.active == "left" else "left"
             self.activeChanged.emit(self.active)
@@ -538,23 +569,23 @@ class SpreadPane(QWidget):
     finished = Signal()                  # leave the aligner, back to the canvas
 
     def __init__(self, left: PageEdit, right: PageEdit,
-                 left_proxy: np.ndarray, right_proxy: np.ndarray, parent=None,
-                 join: bool = False):
+                 left_proxy: np.ndarray, right_proxy: np.ndarray, parent=None):
         super().__init__(parent)
         self.left, self.right = left, right
-        self._join_mode = join
         self._before = (dict(left.__dict__), dict(right.__dict__))
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
 
-        head = QLabel("Join two scans into one page" if join
-                      else "Align facing pages")
+        # One panel, two endings.  Lining up a spread and lining up two passes
+        # of one sheet are the same work; they differ only in what you do with
+        # the result, so that is chosen at the end, once you can see it.
+        head = QLabel("Align or join two pages")
         f = head.font()
         f.setPointSizeF(f.pointSizeF() + 1.5)
         f.setBold(True)
         head.setFont(f)
-        head.setStyleSheet("color:#e6e9ee;")
+        theme.heading(head)
         root.addWidget(head)
 
         self.view = SpreadView(self)
@@ -563,25 +594,17 @@ class SpreadPane(QWidget):
 
         self.status = QLabel("Drag either page to slide it under its crop · "
                              "Tab switches sides · [ ] rotate by 0.01°")
-        self.status.setStyleSheet("color:#9aa0aa;")
+        theme.hint(self.status)
         root.addWidget(self.status)
         self.view.statusMessage.connect(self.status.setText)
 
-        # The control strip is a row of group boxes, and its combined minimum
-        # width is what used to set the whole pane's minimum - which the
-        # splitter then took out of the page queue, squeezing it to a single
-        # column and leaving it there.  In a scroll area it asks for nothing.
         bar = QWidget()
+        bar.setObjectName("spread_controls")
         bar.setLayout(self._controls())
-        scroll = QScrollArea()
-        scroll.setWidget(bar)
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.NoFrame)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll.setMinimumWidth(120)
-        scroll.setFixedHeight(bar.sizeHint().height() + 14)
-        root.addWidget(scroll)
+        pol = QSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        pol.setHeightForWidth(True)          # so wrapping actually claims rows
+        bar.setSizePolicy(pol)
+        root.addWidget(bar)
         self.view.changed.connect(self._refresh)
         self.view.activeChanged.connect(lambda _s: self._refresh())
         self._refresh()
@@ -592,100 +615,118 @@ class SpreadPane(QWidget):
             self.status.setText(
                 "Sizes linked — both pages follow whichever crop you resize")
 
-    def _controls(self) -> QHBoxLayout:
-        bar = QHBoxLayout()
+    def _controls(self) -> QLayout:
+        """One wrapping row of clusters.
 
-        g_ang = QGroupBox("Angle")
-        ha = QHBoxLayout(g_ang)
+        The group boxes are gone: four titled frames cost a line of text and
+        eight edges of padding to label controls whose own words already say
+        what they do, and that padding is most of why the strip did not fit.
+        What is left is icons where the app already uses that icon for the same
+        job elsewhere, and short words where it does not.
+        """
+        bar = FlowLayout(margin=2, hspace=8, vspace=6)
+
+        # ---- angle
         self.sp_left = QDoubleSpinBox()
         self.sp_right = QDoubleSpinBox()
         for sp, side in ((self.sp_left, "left"), (self.sp_right, "right")):
             sp.setRange(-45, 45)
             sp.setDecimals(3)
             sp.setSingleStep(0.01)
-            sp.setSuffix(" °")
+            sp.setSuffix("°")
             sp.setKeyboardTracking(False)
+            sp.setFixedWidth(82)
             sp.valueChanged.connect(lambda v, s=side: self._set_angle(s, v))
-            ha.addWidget(QLabel("L" if side == "left" else "R"))
-            ha.addWidget(sp)
-        b_match_a = QPushButton("Match")
-        b_match_a.setToolTip("Copy the active page's angle to the other page")
-        b_match_a.clicked.connect(self.view.match_angle)
-        ha.addWidget(b_match_a)
-        bar.addWidget(g_ang)
+        self.sp_left.setToolTip("Angle of the left page")
+        self.sp_right.setToolTip("Angle of the right page")
+        b_match_a = _tool("level", "Copy the active page's angle to the other",
+                          self.view.match_angle)
+        bar.addWidget(_cluster(QLabel("L"), self.sp_left,
+                               QLabel("R"), self.sp_right, b_match_a))
+        bar.addWidget(_sep())
 
-        g_guide = QGroupBox("Guides")
-        hg = QHBoxLayout(g_guide)
-        b1 = QPushButton("Add ―")
-        b1.clicked.connect(lambda: self.view.add_guide(True))
-        b2 = QPushButton("Add │")
-        b2.clicked.connect(lambda: self.view.add_guide(False))
-        b3 = QPushButton("Clear")
-        b3.clicked.connect(self.view.clear_guides)
-        for b in (b1, b2, b3):
-            hg.addWidget(b)
-        bar.addWidget(g_guide)
+        # ---- guides.  Same three icons as the top bar, for the same actions.
+        bar.addWidget(_cluster(
+            _tool("guide_h", "Add a level guide across both pages",
+                  lambda: self.view.add_guide(True)),
+            _tool("guide_v", "Add an upright guide across both pages",
+                  lambda: self.view.add_guide(False)),
+            _tool("guide_clear", "Clear the guides", self.view.clear_guides),
+            spacing=2))
+        bar.addWidget(_sep())
 
-        g_size = QGroupBox("Match sizes")
-        hs = QHBoxLayout(g_size)
-        for label, dim in (("Height", "height"), ("Width", "width"), ("Both", "both")):
+        # ---- sizes
+        size_buttons = []
+        for label, dim, tip in (("H", "height", "Match the heights"),
+                                ("W", "width", "Match the widths"),
+                                ("Both", "both", "Match both dimensions")):
             b = QPushButton(label)
+            b.setToolTip(f"{tip} — the other page follows the active one")
+            b.setFixedHeight(26)
+            b.setFixedWidth(52 if label == "Both" else 30)
+            theme.compact(b)
             b.clicked.connect(lambda _=False, d=dim: self.view.match_size(d))
-            hs.addWidget(b)
-        b_top = QPushButton("Align tops")
+            size_buttons.append(b)
+        b_top = QPushButton("Tops")
+        b_top.setToolTip("Line the two pages up by their top edges")
+        b_top.setFixedHeight(26)
         b_top.clicked.connect(self.view.align_tops)
-        hs.addWidget(b_top)
-        self.chk_link_size = QCheckBox("Link")
-        self.chk_link_size.setToolTip(
+        self.chk_link_size = _tool(
+            "link",
             "Keep both pages the same size. Drag either crop frame by its "
             "handles and the other follows — size only, so each page stays "
             "where it sits over its own scan.\nTurning it on matches the "
-            "other page to the active one straight away.")
+            "other page to the active one straight away.",
+            self._set_link_size, checkable=True)
         self.chk_link_size.setChecked(self.view.link_size)
-        self.chk_link_size.toggled.connect(self._set_link_size)
-        hs.addWidget(self.chk_link_size)
-        bar.addWidget(g_size)
+        bar.addWidget(_cluster(*size_buttons, b_top, self.chk_link_size))
+        bar.addWidget(_sep())
 
-        g_view = QGroupBox("View")
-        hv = QHBoxLayout(g_view)
+        # ---- view
         self.sp_gap = QSpinBox()
         self.sp_gap.setRange(0, 400)
-        self.sp_gap.setSuffix(" px gap")
+        self.sp_gap.setSuffix(" px")
+        self.sp_gap.setFixedWidth(72)
+        self.sp_gap.setToolTip("Gap at the gutter, in proxy pixels")
         self.sp_gap.valueChanged.connect(self._set_gap)
-        hv.addWidget(self.sp_gap)
-        self.chk_beyond = QCheckBox("Show beyond crop")
+        self.chk_beyond = QCheckBox("Ghost")
+        self.chk_beyond.setToolTip("Show the area of each scan outside its crop")
         self.chk_beyond.setChecked(True)
         self.chk_beyond.toggled.connect(self._set_beyond)
-        hv.addWidget(self.chk_beyond)
-        self.chk_link = QCheckBox("Link vertical")
+        self.chk_link = QCheckBox("Lock ↕")
         self.chk_link.setToolTip("Slide both pages up and down together")
         self.chk_link.toggled.connect(lambda v: setattr(self.view, "link_vertical", v))
-        hv.addWidget(self.chk_link)
-        b_fit = QPushButton("Fit")
-        b_fit.clicked.connect(self.view.fit)
-        hv.addWidget(b_fit)
-        bar.addWidget(g_view)
+        bar.addWidget(_cluster(QLabel("Gap"), self.sp_gap, self.chk_beyond,
+                               self.chk_link,
+                               _tool("fitview", "Fit both pages in the view",
+                                     self.view.fit)))
+        bar.addWidget(_sep())
 
-        bar.addStretch(1)
+        # ---- the sizes readout, and the three ways out
         self.lbl_sizes = QLabel()
-        self.lbl_sizes.setStyleSheet("color:#9aa0aa;")
+        theme.hint(self.lbl_sizes)
         bar.addWidget(self.lbl_sizes)
 
         b_cancel = QPushButton("Revert")
+        b_cancel.setToolTip("Put both pages back as they were and leave")
         b_cancel.clicked.connect(self._revert)
+        b_ok = QPushButton("Keep as two pages")
+        b_ok.setToolTip(
+            "A spread: each page keeps the crop and angle set here, the two are "
+            "recorded as a pair, and they stay two separate files.")
+        b_ok.clicked.connect(self._accept)
+        # the non-destructive ending is the one Enter reaches
+        b_ok.setDefault(True)
         self.b_join = QPushButton("Join into one page")
         self.b_join.setToolTip(
-            "Make these two scans a single page. They are butted together "
-            "exactly as shown, so trim each crop's inner edge first to cut the "
-            "seam off. The source files are not modified, and the page can be "
-            "split apart again later.")
+            "One sheet scanned in two passes: make them a single page, butted "
+            "together exactly as shown - so trim each crop's inner edge first "
+            "to cut the seam off. The source files are not modified, and "
+            "Page ▸ Split a joined page apart takes it back.")
         self.b_join.clicked.connect(self._join)
-        b_ok = QPushButton("Keep alignment")
-        b_ok.clicked.connect(self._accept)
-        (self.b_join if self._join_mode else b_ok).setDefault(True)
-        bar.addWidget(b_cancel)
-        bar.addWidget(self.b_join)
-        bar.addWidget(b_ok)
+        for b in (b_cancel, b_ok, self.b_join):
+            b.setFixedHeight(26)
+        bar.addWidget(_cluster(b_cancel, b_ok, self.b_join, spacing=6))
         return bar
 
     # ------------------------------------------------------------------ slots

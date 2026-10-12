@@ -179,6 +179,50 @@ def build_join(edit: PageEdit, part_arrays: Optional[list] = None, *,
     return canvas
 
 
+def base_preview(edit: PageEdit, tier: str = "proxy",
+                 build_if_missing: bool = False,
+                 full_detail: bool = False) -> Optional[np.ndarray]:
+    """The page's base image at preview size - before orientation, angle, crop.
+
+    For an ordinary page that is the cached proxy of its scan. For a joined
+    page it is the parts assembled, and a part may itself be a joined page, so
+    this recurses. Everything that shows a page on screen has to come through
+    here: a joined page's `path` is only its *first* scan, and every place
+    that read `path` directly got that one scan - the aligner treated a joined
+    page as a single page, and the book view stretched the first scan across
+    the width of the whole joined page.
+
+    Returns None if any scan underneath has not been decoded yet (and
+    `build_if_missing` is off), so the caller can wait rather than show half a
+    page.
+
+    A joined page is normally capped at the tier's size like any page, which
+    for two scans side by side is a lower scale than either scan alone.
+    `full_detail` builds it at its scans' own preview scale instead - for
+    showing it next to a single scan, where the two have to match.
+    """
+    from . import proxycache                       # render must not need Qt
+    if not edit.join:
+        return proxycache.load(edit.path, tier, build_if_missing=build_if_missing)
+    arrs, scales = [], []
+    for part in edit.parts():
+        a = base_preview(part, tier, build_if_missing, full_detail)
+        if a is None:
+            return None
+        arrs.append(a)
+        # proxies are stored unrotated, so measure against the unrotated width
+        scales.append(a.shape[1] / float(part.raw_size()[0] or a.shape[1]))
+    W, H = join_size(edit.join)
+    cap = {"thumb": proxycache.THUMB, "detail": proxycache.DETAIL}.get(
+        tier, proxycache.PROXY)
+    scale = min(1.0, cap / float(max(W, H) or 1))
+    if full_detail:
+        # as sharp as the least sharp part - more would invent pixels
+        scale = min(1.0, min(scales))
+    return build_join(edit, arrs, scale=scale, part_scales=scales,
+                      interp="linear")
+
+
 def render(edit: PageEdit, arr: Optional[np.ndarray] = None, *,
            interp: str = "lanczos", fill: int = 255,
            output_scale: float = 1.0,

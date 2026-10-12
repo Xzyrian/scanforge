@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox, QHBoxLayout
                                QVBoxLayout, QWidget)
 
 from ..model import Project
+from . import theme
 
 
 class SizeMatchDialog(QDialog):
@@ -38,7 +39,7 @@ class SizeMatchDialog(QDialog):
                       "grouped. Pick a group, set the size you want it to be, "
                       "and every page in it is nudged onto that exact size.")
         head.setWordWrap(True)
-        head.setStyleSheet("color:#aeb4bd;")
+        theme.hint(head)
         v.addWidget(head)
 
         row = QHBoxLayout()
@@ -59,6 +60,8 @@ class SizeMatchDialog(QDialog):
         v.addLayout(row)
 
         self.list = QListWidget()
+        # room to read each group, and to click the one you mean
+        self.list.setStyleSheet("QListWidget::item { padding:5px 6px; }")
         self.list.currentRowChanged.connect(self._pick_group)
         v.addWidget(self.list, 1)
 
@@ -80,7 +83,7 @@ class SizeMatchDialog(QDialog):
 
         self.note = QLabel("")
         self.note.setWordWrap(True)
-        self.note.setStyleSheet("color:#9aa0aa;")
+        theme.hint(self.note)
         v.addWidget(self.note)
 
         box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
